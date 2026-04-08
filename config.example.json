@@ -1,0 +1,14 @@
+{
+  "embedding": {
+    "type": "ollama",
+    "apiKey": null,
+    "baseUrl": "http://localhost:11434",
+    "model": "nomic-embed-text"
+  },
+  "codePatterns": ["**/*.{ts,tsx,js,jsx}"],
+  "docPatterns": ["docs/*.md", "CLAUDE.md", ".claude/rules/*.md"],
+  "skipPatterns": [
+    "node_modules", ".next", "/dist/", "/build/",
+    ".bundle.", ".min.", "__tests__", "__mocks__"
+  ]
+}
