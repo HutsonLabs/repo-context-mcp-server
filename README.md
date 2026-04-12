@@ -121,6 +121,22 @@ Config file resolution (first found wins):
 | Mistral | mistral-embed | 1024 | `mistral` |
 | LM Studio | (custom) | 768 | `lmstudio` |
 
+## Usage with Claude Code
+
+To ensure Claude always uses repo-context as its first tool when exploring your codebase, add the following to your project's `CLAUDE.md` under a "Context Retrieval" section:
+
+```markdown
+## Context Retrieval
+
+Always use the repo-context MCP tools **first** when exploring the codebase — before Glob, Grep, or Read. Load their schemas via ToolSearch at the start of each conversation, then query them for context before falling back to manual file traversal.
+
+- `search_code` — find implementations, patterns, files
+- `search_docs` — find architecture, standards, guidelines, component registry
+- `search_memory` — find past decisions, feedback, project context
+```
+
+This ensures every team member gets the same semantic-search-first experience, regardless of their personal Claude Code memory or settings.
+
 ## How it works
 
 - **Code indexing** — TypeScript AST-aware chunking splits at top-level declarations. Falls back to sliding window (200 lines, 50-line overlap) for other file types.
