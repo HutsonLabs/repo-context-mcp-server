@@ -22,11 +22,27 @@ import {
   indexCode,
   indexDocs,
   indexMemory,
+  indexWiki,
   searchCode,
   searchDocs,
   searchMemory,
+  searchWiki,
 } from './lancedb.js';
 import { startWatcher } from './watcher.js';
+import {
+  buildGraph,
+  loadGraph,
+  queryDependencies,
+  queryCoChanges,
+  queryTypeConsumers,
+} from './graph.js';
+import {
+  initWiki,
+  readWikiPage,
+  writeWikiPage,
+  listWikiPages,
+  getWikiDir,
+} from './wiki.js';
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -65,14 +81,22 @@ function deriveMemoryDir(root: string): string {
 
 const memoryDir = config.memoryDir ?? deriveMemoryDir(projectRoot);
 const indexDir = resolve(projectRoot, '.repo-context');
+const graphConfig = config.graph ?? {};
+const wikiConfig = config.wiki ?? {};
 
 if (!existsSync(indexDir)) {
   mkdirSync(indexDir, { recursive: true });
 }
 
+// Initialize wiki directory
+const wikiDir = (wikiConfig.autoInit !== false)
+  ? initWiki(indexDir)
+  : getWikiDir(indexDir);
+
 console.error(`[config] Project root: ${projectRoot}`);
 console.error(`[config] Memory dir: ${memoryDir}`);
 console.error(`[config] Index dir: ${indexDir}`);
+console.error(`[config] Wiki dir: ${wikiDir}`);
 console.error(`[config] Code patterns: ${codePatterns.join(', ')}`);
 console.error(`[config] Doc patterns: ${docPatterns.join(', ')}`);
 
@@ -82,13 +106,26 @@ console.error(`[config] Doc patterns: ${docPatterns.join(', ')}`);
 
 async function buildIndex() {
   console.error('[startup] Building index...');
-  const [codeCount, docsCount, memoryCount] = await Promise.all([
+  const [codeCount, docsCount, memoryCount, wikiCount] = await Promise.all([
     indexCode(projectRoot, indexDir, config.embedding, codePatterns, skipPatterns),
     indexDocs(projectRoot, indexDir, config.embedding, docPatterns),
     indexMemory(memoryDir, indexDir, config.embedding),
+    indexWiki(wikiDir, indexDir, config.embedding),
   ]);
+
+  // Build dependency graph (after code index since it uses same file patterns)
+  const graph = await buildGraph(
+    projectRoot,
+    indexDir,
+    codePatterns,
+    skipPatterns,
+    graphConfig.coChangeMinCount ?? 3,
+    graphConfig.coChangeMaxCommits ?? 500,
+  );
+
+  const edgeCount = Object.values(graph.imports).reduce((sum, arr) => sum + arr.length, 0);
   console.error(
-    `[startup] Index built: ${codeCount} code, ${docsCount} docs, ${memoryCount} memory chunks`,
+    `[startup] Index built: ${codeCount} code, ${docsCount} docs, ${memoryCount} memory, ${wikiCount} wiki chunks, ${edgeCount} import edges, ${graph.coChanges.length} co-change pairs`,
   );
 }
 
@@ -191,25 +228,278 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
+// Graph tools
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'query_dependencies',
+  'Find what a file imports and what imports it. Use to understand coupling before changing a file.',
+  {
+    file_path: z.string().describe('Relative file path from project root'),
+    direction: z
+      .enum(['imports', 'importedBy', 'both'])
+      .default('both')
+      .describe('Which direction to traverse (default: both)'),
+    depth: z.number().min(1).max(5).default(1).describe('How many levels deep to traverse (default: 1)'),
+  },
+  async ({ file_path, direction, depth }) => {
+    try {
+      const graph = loadGraph(indexDir);
+      if (!graph) {
+        return { content: [{ type: 'text' as const, text: 'Dependency graph not built yet. It will be available after the next index build.' }] };
+      }
+      const result = queryDependencies(graph, file_path, direction, depth);
+      const parts: string[] = [`## Dependencies for \`${file_path}\``];
+
+      if (result.imports.length > 0) {
+        parts.push(`\n### Imports (${result.imports.length})`);
+        for (const f of result.imports) {
+          const names = graph.namedImports[`${file_path}::${f}`];
+          parts.push(`- \`${f}\`${names ? ` (${names.join(', ')})` : ''}`);
+        }
+      }
+
+      if (result.importedBy.length > 0) {
+        parts.push(`\n### Imported by (${result.importedBy.length})`);
+        for (const f of result.importedBy) {
+          const names = graph.namedImports[`${f}::${file_path}`];
+          parts.push(`- \`${f}\`${names ? ` (${names.join(', ')})` : ''}`);
+        }
+      }
+
+      if (result.imports.length === 0 && result.importedBy.length === 0) {
+        parts.push('\nNo dependencies found for this file.');
+      }
+
+      return { content: [{ type: 'text' as const, text: parts.join('\n') }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'query_co_changes',
+  'Find files that frequently change together in git history. Use to discover implicit coupling not visible from imports.',
+  {
+    file_path: z.string().describe('Relative file path from project root'),
+    min_count: z.number().min(1).default(2).describe('Minimum co-change count to include (default: 2)'),
+  },
+  async ({ file_path, min_count }) => {
+    try {
+      const graph = loadGraph(indexDir);
+      if (!graph) {
+        return { content: [{ type: 'text' as const, text: 'Dependency graph not built yet.' }] };
+      }
+      const entries = queryCoChanges(graph, file_path, min_count);
+      if (entries.length === 0) {
+        return { content: [{ type: 'text' as const, text: `No co-change pairs found for \`${file_path}\` (min count: ${min_count}).` }] };
+      }
+
+      const lines = [`## Co-change pairs for \`${file_path}\`\n`];
+      for (const e of entries) {
+        const other = e.fileA === file_path ? e.fileB : e.fileA;
+        lines.push(`- \`${other}\` (${e.count} commits together)`);
+      }
+      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'query_type_consumers',
+  'Find where a type, interface, or export is defined and which files consume it. Use before modifying a type to find all consumers.',
+  {
+    type_name: z.string().describe('Name of the type, interface, enum, or exported symbol'),
+  },
+  async ({ type_name }) => {
+    try {
+      const graph = loadGraph(indexDir);
+      if (!graph) {
+        return { content: [{ type: 'text' as const, text: 'Dependency graph not built yet.' }] };
+      }
+      const result = queryTypeConsumers(graph, type_name);
+
+      const lines = [`## Type: \`${type_name}\`\n`];
+
+      if (result.definedIn.length > 0) {
+        lines.push('### Defined in');
+        for (const f of result.definedIn) {
+          const exp = graph.typeExports[f]?.find((e) => e.name === type_name);
+          lines.push(`- \`${f}\` (${exp?.kind ?? 'unknown'})`);
+        }
+      } else {
+        lines.push('### Defined in\n*Not found in indexed exports.*');
+      }
+
+      if (result.consumedBy.length > 0) {
+        lines.push(`\n### Consumed by (${result.consumedBy.length} files)`);
+        for (const f of result.consumedBy) {
+          lines.push(`- \`${f}\``);
+        }
+      } else {
+        lines.push('\n### Consumed by\n*No consumers found.*');
+      }
+
+      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Wiki tools
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'search_wiki',
+  'Semantic search across the project wiki — architectural decisions, known pitfalls, tribal knowledge.',
+  {
+    query: z.string().describe('What to search for in the wiki'),
+    k: z.number().min(1).max(10).default(3).describe('Number of results (default 3)'),
+  },
+  async ({ query, k }) => {
+    try {
+      const results = await searchWiki(query, config.embedding, indexDir, k);
+      if (results.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No matching wiki pages found.' }] };
+      }
+      const text = results
+        .map((r, i) => `### ${i + 1}. ${r.file} > ${r.section}\n${r.chunk}`)
+        .join('\n\n---\n\n');
+      return { content: [{ type: 'text' as const, text }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'read_wiki_page',
+  'Read a specific wiki page by name.',
+  {
+    page_name: z.string().describe('Page name (e.g., "zustand-patterns" or "editor-architecture")'),
+  },
+  async ({ page_name }) => {
+    try {
+      const page = readWikiPage(indexDir, page_name);
+      if (!page) {
+        const pages = listWikiPages(indexDir);
+        const available = pages.map((p) => `- ${p.name}`).join('\n') || '*No pages yet.*';
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Page "${page_name}" not found.\n\n### Available pages:\n${available}`,
+          }],
+        };
+      }
+      return { content: [{ type: 'text' as const, text: page.content }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'write_wiki_page',
+  'Create or update a wiki page. Use to capture architectural decisions, known pitfalls, and tribal knowledge that cannot be derived from code alone. Follow the wiki page format with Summary, Last updated, and Related pages sections.',
+  {
+    page_name: z.string().describe('Page name in lowercase-with-hyphens (e.g., "editor-architecture")'),
+    content: z.string().describe('Full markdown content of the page'),
+  },
+  async ({ page_name, content }) => {
+    try {
+      const result = writeWikiPage(indexDir, page_name, content);
+      // Re-index wiki after write
+      await indexWiki(wikiDir, indexDir, config.embedding);
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Wiki page "${page_name}" ${result.created ? 'created' : 'updated'} successfully.`,
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'list_wiki_pages',
+  'List all wiki pages with their summaries.',
+  {},
+  async () => {
+    try {
+      const pages = listWikiPages(indexDir);
+      if (pages.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: 'No wiki pages yet. Use write_wiki_page to create one.',
+          }],
+        };
+      }
+      const text = pages
+        .map((p) => `- **${p.name}**: ${p.summary || '*No summary*'} (updated: ${p.lastUpdated || 'unknown'})`)
+        .join('\n');
+      return { content: [{ type: 'text' as const, text: `## Wiki Pages\n\n${text}` }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 
 async function main() {
+  // Connect MCP first so the server is available immediately.
+  // Index build runs in the background — searches return empty until ready.
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('[startup] MCP server running on stdio');
+
   await buildIndex();
 
   startWatcher({
     projectRoot,
     memoryDir,
+    wikiDir,
     indexDir,
     embeddingConfig: config.embedding,
     codePatterns,
     docPatterns,
     skipPatterns,
+    graphConfig: {
+      coChangeMinCount: graphConfig.coChangeMinCount ?? 3,
+      coChangeMaxCommits: graphConfig.coChangeMaxCommits ?? 500,
+    },
   });
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('[startup] MCP server running on stdio');
 }
 
 main().catch((err) => {

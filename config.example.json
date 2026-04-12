@@ -10,5 +10,12 @@
   "skipPatterns": [
     "node_modules", ".next", "/dist/", "/build/",
     ".bundle.", ".min.", "__tests__", "__mocks__"
-  ]
+  ],
+  "graph": {
+    "coChangeMinCount": 3,
+    "coChangeMaxCommits": 500
+  },
+  "wiki": {
+    "autoInit": true
+  }
 }

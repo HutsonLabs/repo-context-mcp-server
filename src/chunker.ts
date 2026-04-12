@@ -254,6 +254,14 @@ export function chunkMemory(source: string): { chunk: Chunk; frontmatter: Memory
 }
 
 // ---------------------------------------------------------------------------
+// Wiki chunking (split on ## headings, same as docs)
+// ---------------------------------------------------------------------------
+
+export function chunkWiki(source: string): Chunk[] {
+  return chunkMarkdown(source);
+}
+
+// ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 

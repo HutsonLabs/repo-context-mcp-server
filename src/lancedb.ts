@@ -5,13 +5,15 @@ import type {
   CodeRow,
   DocsRow,
   MemoryRow,
+  WikiRow,
   EmbeddingProviderConfig,
   CodeSearchResult,
   DocsSearchResult,
   MemorySearchResult,
+  WikiSearchResult,
 } from './types.js';
 import { embedBatch, embedSingle, getDimensions } from './embeddings.js';
-import { chunkCode, chunkMarkdown, chunkMemory, contentHash } from './chunker.js';
+import { chunkCode, chunkMarkdown, chunkMemory, chunkWiki, contentHash } from './chunker.js';
 import { readFileSync, statSync, readdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { Glob } from 'bun';
@@ -31,6 +33,7 @@ export async function connect(indexDir: string): Promise<lancedb.Connection> {
 const CODE_TABLE = 'code';
 const DOCS_TABLE = 'docs';
 const MEMORY_TABLE = 'memory';
+const WIKI_TABLE = 'wiki';
 
 // ---------------------------------------------------------------------------
 // Index building
@@ -236,6 +239,70 @@ export async function indexMemory(
   return fullRows.length;
 }
 
+export async function indexWiki(
+  wikiDir: string,
+  indexDir: string,
+  config: EmbeddingProviderConfig,
+): Promise<number> {
+  const conn = await connect(indexDir);
+
+  let entries: string[];
+  try {
+    entries = readdirSync(wikiDir).filter((f) => f.endsWith('.md'));
+  } catch {
+    console.error('[index] Wiki directory not found, skipping');
+    return 0;
+  }
+
+  const existing = await getExistingHashes(conn, WIKI_TABLE);
+  const rows: Array<Omit<WikiRow, 'vector'>> = [];
+  const texts: string[] = [];
+
+  for (const file of entries) {
+    const absPath = join(wikiDir, file);
+    let content: string;
+    try {
+      content = readFileSync(absPath, 'utf-8');
+    } catch {
+      continue;
+    }
+    const hash = contentHash(content);
+    if (existing.get(file) === hash) continue;
+
+    const mtime = statSync(absPath).mtimeMs;
+    const chunks = chunkWiki(content);
+
+    for (const chunk of chunks) {
+      rows.push({
+        id: `${file}:${chunk.section}`,
+        file_path: file,
+        section: chunk.section,
+        chunk_text: chunk.chunkText,
+        mtime,
+        content_hash: hash,
+      });
+      texts.push(chunk.chunkText);
+    }
+  }
+
+  if (rows.length === 0) {
+    console.error('[index] Wiki table up to date');
+    return 0;
+  }
+
+  console.error(`[index] Embedding ${rows.length} wiki chunks...`);
+  const vectors = await embedBatch(texts, config);
+
+  const fullRows: WikiRow[] = rows.map((row, i) => ({
+    ...row,
+    vector: vectors[i],
+  }));
+
+  await upsertRows(conn, WIKI_TABLE, fullRows);
+  console.error(`[index] Indexed ${fullRows.length} wiki chunks`);
+  return fullRows.length;
+}
+
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
@@ -331,6 +398,32 @@ export async function searchMemory(
     file: r.file_path,
     name: r.name,
     type: r.type,
+    chunk: r.chunk_text,
+    score: r._distance != null ? 1 / (1 + r._distance) : 0,
+  }));
+}
+
+export async function searchWiki(
+  query: string,
+  config: EmbeddingProviderConfig,
+  indexDir: string,
+  k: number = 3,
+): Promise<WikiSearchResult[]> {
+  const conn = await connect(indexDir);
+  const queryVec = await embedSingle(query, config);
+
+  let table: lancedb.Table;
+  try {
+    table = await conn.openTable(WIKI_TABLE);
+  } catch {
+    return [];
+  }
+
+  const results = await table.search(queryVec).limit(k).toArray();
+
+  return results.map((r: any) => ({
+    file: r.file_path,
+    section: r.section,
     chunk: r.chunk_text,
     score: r._distance != null ? 1 / (1 + r._distance) : 0,
   }));

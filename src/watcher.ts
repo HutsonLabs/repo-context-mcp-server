@@ -2,24 +2,31 @@
 
 import { watch } from 'chokidar';
 import type { EmbeddingProviderConfig } from './types.js';
-import { indexCode, indexDocs, indexMemory } from './lancedb.js';
+import { indexCode, indexDocs, indexMemory, indexWiki } from './lancedb.js';
+import { buildGraph } from './graph.js';
 
 const DEBOUNCE_MS = 5000;
 
 interface WatcherConfig {
   projectRoot: string;
   memoryDir: string;
+  wikiDir: string;
   indexDir: string;
   embeddingConfig: EmbeddingProviderConfig;
   codePatterns: string[];
   docPatterns: string[];
   skipPatterns: string[];
+  graphConfig: {
+    coChangeMinCount: number;
+    coChangeMaxCommits: number;
+  };
 }
 
 export function startWatcher(config: WatcherConfig): () => void {
   let codeTimer: ReturnType<typeof setTimeout> | null = null;
   let docsTimer: ReturnType<typeof setTimeout> | null = null;
   let memoryTimer: ReturnType<typeof setTimeout> | null = null;
+  let wikiTimer: ReturnType<typeof setTimeout> | null = null;
   let isIndexing = false;
 
   const debounce = (
@@ -59,6 +66,15 @@ export function startWatcher(config: WatcherConfig): () => void {
   codeWatcher.on('all', () => {
     codeTimer = debounce(codeTimer, async () => {
       await indexCode(config.projectRoot, config.indexDir, config.embeddingConfig, config.codePatterns, config.skipPatterns);
+      // Rebuild graph when code changes
+      await buildGraph(
+        config.projectRoot,
+        config.indexDir,
+        config.codePatterns,
+        config.skipPatterns,
+        config.graphConfig.coChangeMinCount,
+        config.graphConfig.coChangeMaxCommits,
+      );
     });
   });
 
@@ -87,14 +103,28 @@ export function startWatcher(config: WatcherConfig): () => void {
     });
   });
 
+  const wikiWatcher = watch('*.md', {
+    cwd: config.wikiDir,
+    persistent: true,
+    ignoreInitial: true,
+  });
+
+  wikiWatcher.on('all', () => {
+    wikiTimer = debounce(wikiTimer, async () => {
+      await indexWiki(config.wikiDir, config.indexDir, config.embeddingConfig);
+    });
+  });
+
   console.error('[watcher] Watching for changes...');
 
   return () => {
     if (codeTimer) clearTimeout(codeTimer);
     if (docsTimer) clearTimeout(docsTimer);
     if (memoryTimer) clearTimeout(memoryTimer);
+    if (wikiTimer) clearTimeout(wikiTimer);
     codeWatcher.close();
     docsWatcher.close();
     memoryWatcher.close();
+    wikiWatcher.close();
   };
 }
