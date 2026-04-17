@@ -59,6 +59,11 @@ export async function indexCode(
 
   console.error(`[index] Found ${files.length} code files`);
 
+  const pruned = await pruneDeletedFiles(conn, CODE_TABLE, new Set(files));
+  if (pruned > 0) {
+    console.error(`[index] Pruned ${pruned} deleted code file(s) from index`);
+  }
+
   const existing = await getExistingHashes(conn, CODE_TABLE);
 
   const rows: Array<Omit<CodeRow, 'vector'>> = [];
@@ -126,6 +131,11 @@ export async function indexDocs(
     }
   }
 
+  const prunedDocs = await pruneDeletedFiles(conn, DOCS_TABLE, new Set(docPaths));
+  if (prunedDocs > 0) {
+    console.error(`[index] Pruned ${prunedDocs} deleted doc file(s) from index`);
+  }
+
   const existing = await getExistingHashes(conn, DOCS_TABLE);
   const rows: Array<Omit<DocsRow, 'vector'>> = [];
   const texts: string[] = [];
@@ -190,6 +200,11 @@ export async function indexMemory(
     return 0;
   }
 
+  const prunedMem = await pruneDeletedFiles(conn, MEMORY_TABLE, new Set(entries));
+  if (prunedMem > 0) {
+    console.error(`[index] Pruned ${prunedMem} deleted memory file(s) from index`);
+  }
+
   const existing = await getExistingHashes(conn, MEMORY_TABLE);
   const rows: Array<Omit<MemoryRow, 'vector'>> = [];
   const texts: string[] = [];
@@ -252,6 +267,11 @@ export async function indexWiki(
   } catch {
     console.error('[index] Wiki directory not found, skipping');
     return 0;
+  }
+
+  const prunedWiki = await pruneDeletedFiles(conn, WIKI_TABLE, new Set(entries));
+  if (prunedWiki > 0) {
+    console.error(`[index] Pruned ${prunedWiki} deleted wiki file(s) from index`);
   }
 
   const existing = await getExistingHashes(conn, WIKI_TABLE);
@@ -478,4 +498,55 @@ async function upsertRows(
   } catch {
     await conn.createTable(tableName, rows);
   }
+}
+
+// Remove all rows for files that are no longer present on disk. Runs on every
+// re-index so deletions made while the server was dead (or that chokidar
+// missed) get cleaned up. Returns the number of distinct file paths pruned.
+async function pruneDeletedFiles(
+  conn: lancedb.Connection,
+  tableName: string,
+  presentFiles: Set<string>,
+): Promise<number> {
+  let table: lancedb.Table;
+  try {
+    table = await conn.openTable(tableName);
+  } catch {
+    return 0; // table doesn't exist yet, nothing to prune
+  }
+  let rows: unknown[];
+  try {
+    rows = await table.query().select(['file_path']).toArray();
+  } catch {
+    return 0;
+  }
+  const indexed = new Set<string>();
+  for (const r of rows as Array<{ file_path?: string }>) {
+    if (r.file_path) indexed.add(r.file_path);
+  }
+  const toDelete: string[] = [];
+  for (const fp of indexed) {
+    if (!presentFiles.has(fp)) toDelete.push(fp);
+  }
+  for (const fp of toDelete) {
+    await table.delete(`file_path = '${fp.replace(/'/g, "''")}'`);
+  }
+  return toDelete.length;
+}
+
+// Remove rows for a single file path. Used by the watcher's unlink handler
+// to reflect deletions immediately (before the debounced re-index fires).
+export async function deleteFileFromTable(
+  indexDir: string,
+  tableName: 'code' | 'docs' | 'memory' | 'wiki',
+  filePath: string,
+): Promise<void> {
+  const conn = await connect(indexDir);
+  let table: lancedb.Table;
+  try {
+    table = await conn.openTable(tableName);
+  } catch {
+    return;
+  }
+  await table.delete(`file_path = '${filePath.replace(/'/g, "''")}'`);
 }

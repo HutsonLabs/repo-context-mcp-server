@@ -2,7 +2,7 @@
 
 import { watch } from 'chokidar';
 import type { EmbeddingProviderConfig } from './types.js';
-import { indexCode, indexDocs, indexMemory, indexWiki } from './lancedb.js';
+import { indexCode, indexDocs, indexMemory, indexWiki, deleteFileFromTable } from './lancedb.js';
 import { buildGraph } from './graph.js';
 
 const DEBOUNCE_MS = 5000;
@@ -63,6 +63,15 @@ export function startWatcher(config: WatcherConfig): () => void {
     ignoreInitial: true,
   });
 
+  codeWatcher.on('unlink', async (path) => {
+    // Fast path: reflect deletion immediately. A full re-index still runs via
+    // the debounced 'all' handler, but that pruning happens after 5s+embedding.
+    try {
+      await deleteFileFromTable(config.indexDir, 'code', path);
+    } catch (err) {
+      console.error('[watcher] Immediate unlink failed for code:', err);
+    }
+  });
   codeWatcher.on('all', () => {
     codeTimer = debounce(codeTimer, async () => {
       await indexCode(config.projectRoot, config.indexDir, config.embeddingConfig, config.codePatterns, config.skipPatterns);
@@ -84,6 +93,13 @@ export function startWatcher(config: WatcherConfig): () => void {
     ignoreInitial: true,
   });
 
+  docsWatcher.on('unlink', async (path) => {
+    try {
+      await deleteFileFromTable(config.indexDir, 'docs', path);
+    } catch (err) {
+      console.error('[watcher] Immediate unlink failed for docs:', err);
+    }
+  });
   docsWatcher.on('all', () => {
     docsTimer = debounce(docsTimer, async () => {
       await indexDocs(config.projectRoot, config.indexDir, config.embeddingConfig, config.docPatterns);
@@ -97,6 +113,14 @@ export function startWatcher(config: WatcherConfig): () => void {
     ignoreInitial: true,
   });
 
+  memoryWatcher.on('unlink', async (path) => {
+    try {
+      // Memory table keys by bare filename, not path
+      await deleteFileFromTable(config.indexDir, 'memory', path);
+    } catch (err) {
+      console.error('[watcher] Immediate unlink failed for memory:', err);
+    }
+  });
   memoryWatcher.on('all', () => {
     memoryTimer = debounce(memoryTimer, async () => {
       await indexMemory(config.memoryDir, config.indexDir, config.embeddingConfig);
@@ -109,6 +133,13 @@ export function startWatcher(config: WatcherConfig): () => void {
     ignoreInitial: true,
   });
 
+  wikiWatcher.on('unlink', async (path) => {
+    try {
+      await deleteFileFromTable(config.indexDir, 'wiki', path);
+    } catch (err) {
+      console.error('[watcher] Immediate unlink failed for wiki:', err);
+    }
+  });
   wikiWatcher.on('all', () => {
     wikiTimer = debounce(wikiTimer, async () => {
       await indexWiki(config.wikiDir, config.indexDir, config.embeddingConfig);
