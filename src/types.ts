@@ -38,7 +38,7 @@ export interface ServerConfig {
 }
 
 // ---------------------------------------------------------------------------
-// LanceDB table row types
+// Index row types
 // ---------------------------------------------------------------------------
 
 export interface CodeRow {

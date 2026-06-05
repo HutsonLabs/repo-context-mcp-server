@@ -1,0 +1,189 @@
+// db.test.ts — integration tests for the Postgres + pgvector backend.
+//
+// Exercises the real dedup / upsert / prune / search lifecycle against a live
+// database. A self-contained fake embedding server stands in for Ollama/TEI, so
+// the only external dependency is Postgres (with the pgvector extension).
+//
+// Skipped unless DATABASE_URL is set, e.g.:
+//   DATABASE_URL="postgres://postgres:postgres@localhost:5432/repo_context" bun test
+
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import pg from 'pg';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { EmbeddingProviderConfig } from './types.js';
+import { getDimensions } from './embeddings.js';
+import {
+  initDb,
+  indexCode,
+  searchCode,
+  deleteFileFromTable,
+} from './db.js';
+
+const DB_URL = process.env.DATABASE_URL;
+const DIM = 768; // lmstudio default dim; matches fake embedder output
+
+// Unique repo id so the suite never collides with real data and cleans up cleanly.
+const REPO_ID = `__db_test_${process.pid}`;
+
+// ---------------------------------------------------------------------------
+// Fake embedding server (LM Studio / OpenAI-compatible `/v1/embeddings`)
+// ---------------------------------------------------------------------------
+
+/** Deterministic unit-length vector derived from text — identical text => identical vector. */
+function fakeVector(text: string): number[] {
+  const v = new Array<number>(DIM).fill(0);
+  v[0] = 1; // baseline so an (almost) empty string never produces a zero vector
+  for (let i = 0; i < text.length; i++) {
+    v[text.charCodeAt(i) % DIM] += 1;
+  }
+  const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0)) || 1;
+  return v.map((x) => x / norm);
+}
+
+let server: ReturnType<typeof Bun.serve> | null = null;
+let config: EmbeddingProviderConfig;
+
+// A separate client for setup/teardown and direct row-count assertions.
+let probe: pg.Client | null = null;
+
+async function countRows(source: string, filePath?: string): Promise<number> {
+  const sql = filePath
+    ? `SELECT count(*)::int AS n FROM chunks WHERE repo_id = $1 AND source = $2 AND file_path = $3`
+    : `SELECT count(*)::int AS n FROM chunks WHERE repo_id = $1 AND source = $2`;
+  const params = filePath ? [REPO_ID, source, filePath] : [REPO_ID, source];
+  const { rows } = await probe!.query(sql, params);
+  return rows[0].n as number;
+}
+
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
+  let projectRoot: string;
+
+  beforeAll(async () => {
+    // Fake embedder on an ephemeral port.
+    server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const body = (await req.json()) as { input: string[] };
+        const data = body.input.map((text, index) => ({ index, embedding: fakeVector(text) }));
+        return Response.json({ data });
+      },
+    });
+
+    config = {
+      type: 'lmstudio',
+      apiKey: null,
+      baseUrl: `http://localhost:${server.port}`,
+      model: 'fake-model',
+    };
+    expect(getDimensions(config)).toBe(DIM);
+
+    probe = new pg.Client({ connectionString: DB_URL });
+    await probe.connect();
+    // Pre-clean in case a previous crashed run left rows behind.
+    await probe.query(`DELETE FROM chunks WHERE repo_id = $1`, [REPO_ID]).catch(() => {});
+
+    await initDb({ connectionString: DB_URL!, repoId: REPO_ID, dim: DIM });
+
+    projectRoot = mkdtempSync(join(tmpdir(), 'rc-db-test-'));
+  });
+
+  afterAll(async () => {
+    if (probe) {
+      await probe.query(`DELETE FROM chunks WHERE repo_id = $1`, [REPO_ID]).catch(() => {});
+      await probe.end();
+    }
+    server?.stop(true);
+    if (projectRoot) rmSync(projectRoot, { recursive: true, force: true });
+  });
+
+  function writeProjectFile(rel: string, contents: string): void {
+    const abs = join(projectRoot, rel);
+    mkdirSync(join(abs, '..'), { recursive: true });
+    writeFileSync(abs, contents);
+  }
+
+  test('initDb creates the chunks table with the right vector width', async () => {
+    const { rows } = await probe!.query(
+      `SELECT atttypmod FROM pg_attribute
+        WHERE attrelid = 'chunks'::regclass AND attname = 'embedding'`,
+    );
+    expect(rows).toHaveLength(1);
+    // pgvector stores the declared dimension directly in atttypmod.
+    expect(rows[0].atttypmod).toBe(DIM);
+  });
+
+  test('indexCode inserts chunks and reports a positive count', async () => {
+    writeProjectFile('alpha.ts', `export function alpha() { return 'alpha'; }\n`);
+    writeProjectFile('beta.ts', `export const beta = 42;\nexport function useBeta() { return beta; }\n`);
+
+    const n = await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+    expect(n).toBeGreaterThan(0);
+    expect(await countRows('code')).toBe(n);
+    expect(await countRows('code', 'alpha.ts')).toBeGreaterThan(0);
+  });
+
+  test('re-indexing unchanged files is a no-op (content-hash dedup)', async () => {
+    const before = await countRows('code');
+    const n = await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+    expect(n).toBe(0);
+    expect(await countRows('code')).toBe(before);
+  });
+
+  test('modifying a file replaces its chunks (upsert), not duplicates them', async () => {
+    writeProjectFile('alpha.ts', `export function alpha() { return 'ALPHA-v2'; }\n`);
+
+    const n = await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+    expect(n).toBeGreaterThan(0);
+
+    // Old content gone, new content present; beta.ts untouched.
+    const results = await searchCode('alpha', config, projectRoot, 20);
+    const alphaChunks = results.filter((r) => r.file === 'alpha.ts');
+    expect(alphaChunks.length).toBeGreaterThan(0);
+    const text = alphaChunks.map((r) => r.chunk).join('\n');
+    expect(text).toContain('ALPHA-v2');
+    expect(text).not.toContain("'alpha'");
+  });
+
+  test('pruneDeletedFiles removes rows for files no longer on disk', async () => {
+    expect(await countRows('code', 'beta.ts')).toBeGreaterThan(0);
+
+    rmSync(join(projectRoot, 'beta.ts'));
+    await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+
+    expect(await countRows('code', 'beta.ts')).toBe(0);
+    expect(await countRows('code', 'alpha.ts')).toBeGreaterThan(0);
+  });
+
+  test('searchCode round-trips and respects the file_filter glob', async () => {
+    writeProjectFile('sub/gamma.ts', `export function gamma() { return 'gamma'; }\n`);
+    await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+
+    const all = await searchCode('function', config, projectRoot, 20);
+    const files = new Set(all.map((r) => r.file));
+    expect(files.has('sub/gamma.ts')).toBe(true);
+    expect(files.has('alpha.ts')).toBe(true);
+
+    const scoped = await searchCode('function', config, projectRoot, 20, 'sub/**');
+    expect(scoped.length).toBeGreaterThan(0);
+    expect(scoped.every((r) => r.file.startsWith('sub/'))).toBe(true);
+  });
+
+  test('deleteFileFromTable removes a single file immediately', async () => {
+    expect(await countRows('code', 'sub/gamma.ts')).toBeGreaterThan(0);
+    await deleteFileFromTable(projectRoot, 'code', 'sub/gamma.ts');
+    expect(await countRows('code', 'sub/gamma.ts')).toBe(0);
+    // Sibling rows are untouched.
+    expect(await countRows('code', 'alpha.ts')).toBeGreaterThan(0);
+  });
+
+  test('all written rows are scoped to the configured repo_id', async () => {
+    const { rows } = await probe!.query(
+      `SELECT DISTINCT repo_id FROM chunks WHERE source = 'code' AND file_path = 'alpha.ts'`,
+    );
+    expect(rows.map((r) => r.repo_id)).toContain(REPO_ID);
+  });
+});

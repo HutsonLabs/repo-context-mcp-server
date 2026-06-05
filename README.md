@@ -1,12 +1,15 @@
 # repo-context-mcp-server
 
-MCP server that gives AI coding assistants deep codebase context through three complementary systems:
+MCP server that gives AI coding assistants deep codebase context through four complementary systems:
 
 1. **Vector search** — Semantic similarity search over code, docs, and memory
-2. **Dependency graph** — Import edges, type consumers, and git co-change analysis
+2. **Dependency graph** — Import edges, type/symbol consumers, and git co-change analysis
 3. **LLM Wiki** — AI-maintained knowledge base for decisions and tribal knowledge
+4. **Partition scheduler** — Computes which issues can be worked in parallel without file conflicts
 
-Uses LanceDB for vector storage, TypeScript AST for static analysis, and git history for co-change mining. Supports multiple embedding providers. Attach it to any repository and it bootstraps automatically.
+Vectors are stored in **Postgres + pgvector**, static analysis uses the TypeScript AST, and co-change data is mined from git history. The server speaks the **Streamable HTTP** MCP transport and is **multi-repo**: a single database/instance can serve many repositories, each isolated by a `repo_id`. It ships as a Docker Compose stack (server + database) and bootstraps automatically when pointed at a repo.
+
+> **Architecture note (v1.1).** Earlier versions embedded LanceDB and spoke the stdio transport. The server now runs as a long-lived HTTP service backed by Postgres+pgvector. See [How it works](#how-it-works) for details.
 
 ## Tools
 
@@ -20,7 +23,7 @@ Uses LanceDB for vector storage, TypeScript AST for static analysis, and git his
 
 - **query_dependencies** — Find what a file imports and what imports it, with configurable traversal depth.
 - **query_co_changes** — Find files that frequently change together in git history.
-- **query_type_consumers** — Find where a type/interface is defined and which files consume it.
+- **query_type_consumers** — Find where a type/interface is defined and which files consume it. Supports qualified `defFile::name` lookups for disambiguation.
 
 ### Wiki (knowledge base)
 
@@ -29,74 +32,104 @@ Uses LanceDB for vector storage, TypeScript AST for static analysis, and git his
 - **write_wiki_page** — Create or update a wiki page.
 - **list_wiki_pages** — List all wiki pages with summaries.
 
-## Prerequisites
+### Scheduling
 
-Install [Bun](https://bun.sh):
+- **partition** — Given per-issue "touch sets" (the files each issue plans to modify), compute a conflict graph and a deterministic wave schedule of which issues can run in parallel. See [Partition scheduler](#partition-scheduler).
+
+## Quick start (Docker Compose)
+
+The recommended way to run the server is the bundled Compose stack, which starts Postgres (with the pgvector extension) and the MCP server together.
+
+### Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) with Compose v2
+- An embedding provider reachable from the container. The default `config.docker.json` targets **host [Ollama](https://ollama.com)**, so it runs GPU-free:
+
+  ```sh
+  # macOS
+  brew install ollama
+  ollama serve                     # runs on http://localhost:11434
+  ollama pull nomic-embed-text     # 768-dim embeddings
+  ```
+
+  The container reaches host Ollama via `host.docker.internal` (configured in `docker-compose.yml`).
+
+### Run
 
 ```sh
-curl -fsSL https://bun.sh/install | bash
+# Index the current directory (defaults to "." — override with INDEX_REPO)
+INDEX_REPO=/path/to/your/project docker compose up --build
 ```
 
-Install [Ollama](https://ollama.com) and pull the embedding model:
+This brings up:
+
+| Service | Purpose | Host port |
+|---|---|---|
+| `db` | Postgres 17 + pgvector | `5433` (debugging only) |
+| `mcp` | MCP server (Streamable HTTP) | `3333` → `POST /mcp` |
+
+The server starts serving immediately and builds the index in the background. Check readiness:
 
 ```sh
-# macOS
-brew install ollama
-
-# Start Ollama (runs on http://localhost:11434)
-ollama serve
-
-# Pull the embedding model
-ollama pull nomic-embed-text
+curl localhost:3333/health
+# {"status":"ok","index":"building"}  -> later: {"status":"ok","index":"ready"}
 ```
 
-## Install
+The indexed repo is bind-mounted at `/workspace` (read-write, so `.repo-context/` and the wiki can be written back).
+
+## Connect Claude Code
+
+Point Claude Code at the HTTP endpoint:
 
 ```sh
-git clone <repo-url>
-cd repo-context-mcp-server
+claude mcp add --transport http repo-context http://localhost:3333/mcp
+```
+
+Then restart Claude Code. The tools above become available as `repo-context` MCP tools. Searches return empty until `/health` reports `"index":"ready"`.
+
+## Run locally without Docker
+
+The server requires a reachable Postgres with the `pgvector` extension. With one available, run it directly with [Bun](https://bun.sh):
+
+```sh
+curl -fsSL https://bun.sh/install | bash   # install Bun
 bun install
+
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/repo_context" \
+REPO_ID="my-project" \
+PROJECT_ROOT="/path/to/your/project" \
+PORT=3000 \
+bun run src/index.ts
 ```
 
-## Configure a repository
-
-### 1. Add the MCP server to your project
-
-From your project directory:
+A throwaway pgvector database for local development:
 
 ```sh
-cd /path/to/your/project
-claude mcp add repo-context -s project -- bun /path/to/repo-context-mcp-server/src/index.ts
+docker run -d --name repo-context-db -p 5432:5432 \
+  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=repo_context \
+  pgvector/pgvector:pg17
 ```
-
-This creates a `.mcp.json` file in your project root.
-
-### 2. Create a config file
-
-Create `repo-context.json` in your project root:
-
-```json
-{
-  "embedding": {
-    "type": "ollama",
-    "apiKey": null,
-    "baseUrl": "http://localhost:11434",
-    "model": "nomic-embed-text"
-  }
-}
-```
-
-### 3. Add to .gitignore
-
-```
-.repo-context/
-```
-
-### 4. Restart Claude Code
-
-The server connects immediately on startup. The initial index builds in the background — searches return empty results until indexing completes.
 
 ## Configuration
+
+### Environment variables
+
+Container/runtime settings (override the defaults shown):
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/repo_context` | Postgres connection string (needs the `vector` extension; the server runs `CREATE EXTENSION IF NOT EXISTS vector`). |
+| `REPO_ID` | `default` | Logical id that isolates this repo's rows in the shared `chunks` table. Use a distinct value per repo when sharing one database. |
+| `PROJECT_ROOT` | `process.cwd()` | Absolute path to the repository to index. In Docker this is `/workspace`. |
+| `PORT` | `3000` | HTTP port the server listens on (`POST /mcp`, `GET /health`). |
+
+### Config file
+
+Indexing behavior is controlled by a JSON config. Resolution order (first found wins):
+
+1. `<cwd>/repo-context.json`
+2. `<cwd>/.repo-context/config.json`
+3. `<server-dir>/config.json` (the Docker image copies `config.docker.json` here)
 
 All fields except `embedding` are optional:
 
@@ -109,10 +142,11 @@ All fields except `embedding` are optional:
     "model": "nomic-embed-text"
   },
   "codePatterns": ["**/*.{ts,tsx,js,jsx}"],
-  "docPatterns": ["docs/*.md", "CLAUDE.md", ".claude/rules/*.md"],
+  "docPatterns": ["docs/*.md", "CLAUDE.md", "README.md", ".claude/rules/*.md"],
   "skipPatterns": [
     "node_modules", ".next", "/dist/", "/build/",
-    ".bundle.", ".min.", "__tests__", "__mocks__"
+    ".bundle.", ".min.", "__tests__", "__mocks__",
+    ".claude/worktrees", ".repo-context"
   ],
   "graph": {
     "coChangeMinCount": 3,
@@ -130,27 +164,26 @@ All fields except `embedding` are optional:
 | `codePatterns` | `["**/*.{ts,tsx,js,jsx}"]` | Glob patterns for source code files |
 | `docPatterns` | `["docs/*.md", "CLAUDE.md", ".claude/rules/*.md"]` | Glob patterns for documentation files |
 | `skipPatterns` | node_modules, .next, dist, build, tests, mocks | Substrings in file paths to skip |
-| `projectRoot` | `process.cwd()` | Override project root (auto-detected from MCP `cwd`) |
+| `projectRoot` | `PROJECT_ROOT` env / `process.cwd()` | Override project root |
 | `memoryDir` | auto-detected | Override Claude Code memory directory |
 | `graph.coChangeMinCount` | `3` | Minimum co-occurrence count to record a co-change pair |
 | `graph.coChangeMaxCommits` | `500` | How many commits to scan for co-change analysis |
 | `wiki.autoInit` | `true` | Create wiki directory and index/log files on first run |
 
-Config file resolution (first found wins):
-
-1. `<cwd>/repo-context.json`
-2. `<cwd>/.repo-context/config.json`
-3. `<server-dir>/config.json`
+> The embedding **dimension is derived from the model** (e.g. `nomic-embed-text` → 768, `nomic-embed-code` → 3584) and fixes the `vector(N)` column width at first run. Changing models against an existing database requires a fresh `repo_id` or a reset of the `chunks` table.
 
 ## Embedding providers
 
-| Provider | Model (default) | Dimensions | Config `type` |
+| Provider | Model (example) | Dimensions | Config `type` |
 |---|---|---|---|
 | Ollama | nomic-embed-text | 768 | `ollama` |
+| TEI (HF Text Embeddings Inference) | nomic-embed-code | 3584 | `tei` |
 | OpenAI | text-embedding-3-small | 1536 | `openai` |
 | Google | text-embedding-004 | 768 | `google` |
 | Mistral | mistral-embed | 1024 | `mistral` |
 | LM Studio | (custom) | 768 | `lmstudio` |
+
+The production target is **`nomic-embed-code` served via TEI** (GPU); the Compose default uses host Ollama with `nomic-embed-text` so it works without a GPU. Nomic models use **asymmetric task prefixes** — queries and documents are embedded with different instructions — which the adapter applies automatically.
 
 ## Usage with Claude Code
 
@@ -174,28 +207,45 @@ Always use the repo-context MCP tools **first** when exploring the codebase — 
 
 ### Vector search
 
-- **Code indexing** — TypeScript AST-aware chunking splits at top-level declarations (functions, classes, interfaces, types). Falls back to sliding window (200 lines, 50-line overlap) for other file types. Max chunk size: 6,000 characters.
+- **Code indexing** — TypeScript AST-aware chunking splits at top-level declarations (functions, classes, interfaces, types). Falls back to a sliding window for other file types.
 - **Doc indexing** — Splits markdown on `##` heading boundaries.
 - **Memory indexing** — Indexes Claude Code memory files with YAML frontmatter parsing.
-- **Wiki indexing** — Same heading-based splitting as docs, indexed into a separate LanceDB table.
-- **Deduplication** — Content hashing (SHA-256) avoids re-embedding unchanged files.
-- **File watching** — Chokidar watches for changes with 5-second debounce, re-indexes automatically.
-- **Vector storage** — LanceDB stores embeddings locally in `.repo-context/` within the project.
+- **Wiki indexing** — Same heading-based splitting as docs.
+- **Deduplication** — Content hashing (SHA-256) avoids re-embedding unchanged files; only files whose hash changed are re-embedded.
+- **Pruning** — On every re-index (and on watcher `unlink`), rows for files no longer present on disk are removed, so deletions made while the server was down are cleaned up.
+- **File watching** — Chokidar watches for changes with a debounce and re-indexes automatically.
+- **Vector storage** — All chunks live in a single Postgres `chunks` table with a `vector(N)` column (pgvector), an **HNSW cosine index** for similarity search, and a `(repo_id, source, file_path)` lookup index. Rows are keyed by `(repo_id, source, id)`; writes are transactional delete-then-insert upserts.
+
+### Multi-repo isolation
+
+Every row carries a `repo_id`. One database (and one server, via per-session HTTP transports) can serve many repositories simultaneously — searches, indexing, and pruning are always scoped to the configured `REPO_ID`.
+
+### Transport
+
+The server is a long-lived process exposing **Streamable HTTP** at `POST /mcp`. Each MCP session gets its own transport and `McpServer` instance, routed by the `mcp-session-id` header. `GET /health` reports liveness and index state (`starting` → `building` → `ready`). The server begins accepting connections before the initial index completes.
 
 ### Dependency graph
 
-The graph is built by static analysis and git history, stored as `.repo-context/graph.json`. No embeddings required — queries are direct lookups.
+Built by static analysis and git history, stored as `.repo-context/graph.json`. No embeddings required — queries are direct lookups.
 
-- **Import edges** — TypeScript AST parses every file to extract `import` statements. Relative imports are resolved to actual file paths. Named imports are tracked per edge.
-- **Type exports** — Records which types, interfaces, enums, classes, and functions each file exports.
-- **Type consumers** — Reverse index: given a type name, returns every file that imports it. Use this before modifying a type to find all downstream consumers.
-- **Co-change pairs** — Mines `git log` for files that appear together in commits. Filters out merge commits and large refactors (>20 files). Pairs below the configured threshold are excluded.
-- **Traversal** — `query_dependencies` supports multi-level depth traversal (e.g., depth=2 finds transitive dependencies).
+- **Import edges** — TypeScript AST parses every file to extract `import` statements; relative imports resolve to actual file paths. Named imports are tracked per edge.
+- **Type & symbol consumers** — Reverse index from a type name (and from a qualified `defFile::name`) to every file that imports it. Use this before modifying a type to find all downstream consumers.
+- **Co-change pairs** — Mines `git log` for files that change together, filtering merge commits and large refactors.
+- **HEAD SHA** — The graph records the git HEAD it was built against, so partitions can be stamped/validated.
 - **Auto-rebuild** — The graph rebuilds automatically when code files change (via the file watcher).
+
+### Partition scheduler
+
+`partition` answers: *given a batch of issues and the files each will touch, which can be worked at the same time?*
+
+- **File-level gate** — Two issues conflict **iff their file sets intersect**. This is the only thing that gates parallelization.
+- **Waves** — A deterministic wave schedule is computed via greedy graph coloring. `Wave 1` (the independent set) is the group of issues that can be worked simultaneously; later waves depend on earlier ones clearing.
+- **Hidden-coupling warnings** — If two issues touch files that *historically co-change* (above a threshold), that surfaces as an **advisory warning only** — it never adds a conflict edge or changes the waves.
+- **Deterministic** — Same inputs always produce the same conflict graph, waves, and warnings (issues and shared files are ordered before processing).
 
 ### LLM Wiki
 
-A structured, cross-linked knowledge base maintained by the AI assistant. Stored in `.repo-context/wiki/` as markdown files. Adapted from Andrej Karpathy's LLM Wiki pattern.
+A structured, cross-linked knowledge base maintained by the AI assistant. Stored in `.repo-context/wiki/` as markdown files.
 
 **What belongs in the wiki:**
 - Architectural decisions and their rationale
@@ -226,46 +276,68 @@ Content with [[wiki-links]] to connect related pages.
 - [[related-concept]]
 ```
 
-**Directory structure:**
-```
-.repo-context/wiki/
-  index.md      — Table of contents (auto-created)
-  log.md        — Append-only record of all operations (auto-created)
-  *.md          — Wiki pages created by the AI assistant
-```
-
 ## Architecture
 
 ```
 src/
-  index.ts        Entry point, MCP tool registration, startup
+  index.ts        Entry point, MCP tool registration, HTTP server, startup
   types.ts        Shared TypeScript interfaces
-  lancedb.ts      LanceDB connection, indexing, vector search
-  embeddings.ts   Embedding provider adapter (Ollama, OpenAI, etc.)
+  db.ts           Postgres + pgvector connection, indexing, vector search
+  embeddings.ts   Embedding provider adapter (Ollama, TEI, OpenAI, ...)
   chunker.ts      AST-aware code chunking, markdown splitting
   graph.ts        Dependency graph extraction and co-change mining
+  partition.ts    File-level conflict gate and parallel-wave scheduler
   wiki.ts         Wiki CRUD operations and page management
   watcher.ts      File watcher with debounced re-indexing
+
+Dockerfile          Bun runtime image for the server
+docker-compose.yml  Server + pgvector database
+config.docker.json  Container config (host Ollama embeddings)
 ```
 
 ### Data flow
 
 ```
 Startup
-  1. Load config (repo-context.json)
-  2. Initialize wiki directory
-  3. Connect MCP server (stdio transport)
-  4. Build index in background:
-     a. Code files -> AST chunking -> embed -> LanceDB (code table)
-     b. Doc files -> heading split -> embed -> LanceDB (docs table)
-     c. Memory files -> frontmatter parse -> embed -> LanceDB (memory table)
-     d. Wiki files -> heading split -> embed -> LanceDB (wiki table)
-     e. Code files -> AST import parse -> graph.json
-     f. Git log -> co-change mining -> graph.json
-  5. Start file watchers (debounced re-index on changes)
+  1. Load config (config file) + read env (DATABASE_URL, REPO_ID, PROJECT_ROOT, PORT)
+  2. initDb: connect Postgres, CREATE EXTENSION vector, create `chunks` table + indexes
+  3. Initialize wiki directory
+  4. Start HTTP server (Streamable HTTP, POST /mcp) — serving begins immediately
+  5. Build index in background (state: building -> ready):
+     a. Code files   -> AST chunking     -> embed -> chunks (source='code')
+     b. Doc files    -> heading split     -> embed -> chunks (source='docs')
+     c. Memory files -> frontmatter parse -> embed -> chunks (source='memory')
+     d. Wiki files   -> heading split     -> embed -> chunks (source='wiki')
+     e. Code files   -> AST import parse  -> graph.json
+     f. Git log      -> co-change mining  -> graph.json
+  6. Start file watchers (debounced re-index + prune on changes)
 
 Queries
-  - search_* tools -> embed query -> LanceDB vector search -> results
-  - query_* tools -> load graph.json -> direct lookup -> results
-  - wiki CRUD tools -> read/write files -> re-index wiki table
+  - search_* tools -> embed query -> pgvector cosine search (scoped by repo_id) -> results
+  - query_* tools  -> load graph.json -> direct lookup -> results
+  - partition      -> load graph.json -> conflict graph + waves + advisory warnings
+  - wiki CRUD      -> read/write files -> re-index wiki rows
+```
+
+## Development
+
+### Tests
+
+```sh
+bun test
+```
+
+- **`src/partition.test.ts`** — pure unit tests for the conflict gate, wave scheduling, determinism, and advisory co-change overlay. Requires no external services.
+- **`src/db.test.ts`** — integration tests for the Postgres schema and the dedup / upsert / prune / search lifecycle. They run a self-contained fake embedder (no Ollama needed) and are **skipped unless `DATABASE_URL` is set**:
+
+  ```sh
+  DATABASE_URL="postgres://postgres:postgres@localhost:5432/repo_context" bun test
+  ```
+
+  The suite isolates itself under a dedicated `repo_id` and cleans up after each run.
+
+### Type checking
+
+```sh
+bunx tsc --noEmit
 ```
