@@ -37,6 +37,7 @@ export async function buildGraph(
   const namedImports: Record<string, string[]> = {};
   const typeExports: Record<string, TypeExport[]> = {};
   const typeConsumers: Record<string, string[]> = {};
+  const symbolConsumers: Record<string, string[]> = {};
 
   for (const filePath of files) {
     const absPath = resolve(projectRoot, filePath);
@@ -71,11 +72,19 @@ export async function buildGraph(
           const key = `${filePath}::${edge.target}`;
           namedImports[key] = edge.names;
 
-          // Track type consumers
+          // Track type consumers (bare name — kept for backward compat)
           for (const name of edge.names) {
             if (!typeConsumers[name]) typeConsumers[name] = [];
             if (!typeConsumers[name].includes(filePath)) {
               typeConsumers[name].push(filePath);
+            }
+
+            // Track per-qualified-symbol consumers keyed by "defFile::name".
+            // The definition site is the import edge's target (file imported from).
+            const qualified = `${edge.target}::${name}`;
+            if (!symbolConsumers[qualified]) symbolConsumers[qualified] = [];
+            if (!symbolConsumers[qualified].includes(filePath)) {
+              symbolConsumers[qualified].push(filePath);
             }
           }
         }
@@ -87,6 +96,17 @@ export async function buildGraph(
   const coChanges = mineCoChanges(projectRoot, coChangeMinCount, coChangeMaxCommits);
   console.error(`[graph] Found ${coChanges.length} co-change pairs`);
 
+  // Capture the current git HEAD SHA so partitions can be stamped/validated.
+  let headSha = '';
+  try {
+    headSha = execSync('git rev-parse HEAD', {
+      cwd: projectRoot,
+      encoding: 'utf-8',
+    }).trim();
+  } catch {
+    headSha = '';
+  }
+
   const graph: DependencyGraph = {
     builtAt: new Date().toISOString(),
     imports,
@@ -94,7 +114,9 @@ export async function buildGraph(
     namedImports,
     typeExports,
     typeConsumers,
+    symbolConsumers,
     coChanges,
+    headSha,
   };
 
   // Write to disk
@@ -154,7 +176,26 @@ export function queryCoChanges(
 export function queryTypeConsumers(
   graph: DependencyGraph,
   typeName: string,
-): { definedIn: string[]; consumedBy: string[] } {
+): {
+  definedIn: string[];
+  consumedBy: string[];
+  /** Qualified "defFile::name" keys matching the query, for disambiguation */
+  qualifiedMatches: Array<{ qualified: string; definedIn: string; consumedBy: string[] }>;
+} {
+  const symbolConsumers = graph.symbolConsumers ?? {};
+
+  // Qualified lookup: "defFile::name"
+  if (typeName.includes('::')) {
+    const consumedBy = symbolConsumers[typeName] ?? [];
+    const definedIn = typeName.slice(0, typeName.lastIndexOf('::'));
+    return {
+      definedIn: [definedIn],
+      consumedBy,
+      qualifiedMatches: [{ qualified: typeName, definedIn, consumedBy }],
+    };
+  }
+
+  // Bare-name behavior (backward compatible)
   const consumedBy = graph.typeConsumers[typeName] ?? [];
   const definedIn: string[] = [];
 
@@ -164,7 +205,23 @@ export function queryTypeConsumers(
     }
   }
 
-  return { definedIn, consumedBy };
+  // Collect qualified matches so callers can disambiguate same-named symbols
+  // exported from different files.
+  const qualifiedMatches: Array<{ qualified: string; definedIn: string; consumedBy: string[] }> = [];
+  for (const [qualified, files] of Object.entries(symbolConsumers)) {
+    const idx = qualified.lastIndexOf('::');
+    if (idx === -1) continue;
+    if (qualified.slice(idx + 2) === typeName) {
+      qualifiedMatches.push({
+        qualified,
+        definedIn: qualified.slice(0, idx),
+        consumedBy: files,
+      });
+    }
+  }
+  qualifiedMatches.sort((a, b) => a.qualified.localeCompare(b.qualified));
+
+  return { definedIn, consumedBy, qualifiedMatches };
 }
 
 // ---------------------------------------------------------------------------

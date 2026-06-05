@@ -13,12 +13,13 @@
 //   ~/.claude/projects/<escaped-path>/memory/
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
 import { resolve } from 'node:path';
 import { existsSync, mkdirSync } from 'node:fs';
-import { loadConfig } from './embeddings.js';
+import { loadConfig, getDimensions } from './embeddings.js';
 import {
+  initDb,
   indexCode,
   indexDocs,
   indexMemory,
@@ -27,7 +28,8 @@ import {
   searchDocs,
   searchMemory,
   searchWiki,
-} from './lancedb.js';
+} from './db.js';
+import { partition, formatPartition, type TouchSet } from './partition.js';
 import { startWatcher } from './watcher.js';
 import {
   buildGraph,
@@ -60,7 +62,7 @@ const DEFAULT_SKIP_PATTERNS = [
 // ---------------------------------------------------------------------------
 
 const config = loadConfig();
-const projectRoot = config.projectRoot ?? process.cwd();
+const projectRoot = process.env.PROJECT_ROOT ?? config.projectRoot ?? process.cwd();
 const codePatterns = config.codePatterns ?? DEFAULT_CODE_PATTERNS;
 const docPatterns = config.docPatterns ?? DEFAULT_DOC_PATTERNS;
 const skipPatterns = config.skipPatterns ?? DEFAULT_SKIP_PATTERNS;
@@ -83,6 +85,13 @@ const memoryDir = config.memoryDir ?? deriveMemoryDir(projectRoot);
 const indexDir = resolve(projectRoot, '.repo-context');
 const graphConfig = config.graph ?? {};
 const wikiConfig = config.wiki ?? {};
+
+// Container / serving config (env-overridable)
+const connectionString =
+  process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/repo_context';
+const repoId = process.env.REPO_ID ?? 'default';
+const httpPort = Number(process.env.PORT ?? 3000);
+let indexState: 'starting' | 'building' | 'ready' = 'starting';
 
 if (!existsSync(indexDir)) {
   mkdirSync(indexDir, { recursive: true });
@@ -133,10 +142,11 @@ async function buildIndex() {
 // MCP Server
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({
-  name: 'repo-context',
-  version: '1.0.0',
-});
+function createMcpServer(): McpServer {
+  const server = new McpServer({
+    name: 'repo-context',
+    version: '1.1.0',
+  });
 
 server.tool(
   'search_code',
@@ -473,18 +483,95 @@ server.tool(
   },
 );
 
+  // -------------------------------------------------------------------------
+  // Partition (issue #3): batch parallel-safety scheduler
+  // -------------------------------------------------------------------------
+  server.tool(
+    'partition',
+    'Given per-issue touch sets, compute a conflict graph and a deterministic wave schedule of which issues can run in parallel. File-level gate (two issues conflict iff their file sets intersect). Co-change pairs are surfaced as advisory hidden-coupling warnings only, never as gates.',
+    {
+      touch_sets: z
+        .array(
+          z.object({
+            issue: z.union([z.string(), z.number()]).describe('Issue id'),
+            files: z.array(z.string()).describe('Relative file paths the issue will touch'),
+            symbols: z.array(z.string()).optional().describe('Optional symbol ids (file::name)'),
+          }),
+        )
+        .describe('One entry per issue'),
+      min_co_change: z
+        .number()
+        .min(1)
+        .default(3)
+        .describe('Minimum co-change count to surface a hidden-coupling warning (default 3)'),
+    },
+    async ({ touch_sets, min_co_change }) => {
+      try {
+        const graph = loadGraph(indexDir);
+        if (!graph) {
+          return { content: [{ type: 'text' as const, text: 'Dependency graph not built yet.' }] };
+        }
+        const result = partition(touch_sets as TouchSet[], graph, { coChangeMinCount: min_co_change });
+        return { content: [{ type: 'text' as const, text: formatPartition(result) }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  return server;
+}
+
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 
 async function main() {
-  // Connect MCP first so the server is available immediately.
-  // Index build runs in the background — searches return empty until ready.
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('[startup] MCP server running on stdio');
+  await initDb({ connectionString, repoId, dim: getDimensions(config.embedding) });
+  console.error(`[startup] Postgres ready (repo_id=${repoId}, dim=${getDimensions(config.embedding)})`);
 
+  // Stateful Streamable HTTP: a new session creates its own transport+server;
+  // subsequent requests are routed by the mcp-session-id header.
+  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+
+  Bun.serve({
+    port: httpPort,
+    idleTimeout: 120,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === '/health') {
+        return new Response(JSON.stringify({ status: 'ok', index: indexState }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.pathname !== '/mcp') {
+        return new Response('Not found', { status: 404 });
+      }
+      const sid = req.headers.get('mcp-session-id') ?? undefined;
+      let transport = sid ? sessions.get(sid) : undefined;
+      if (!transport) {
+        let t: WebStandardStreamableHTTPServerTransport;
+        t = new WebStandardStreamableHTTPServerTransport({
+          sessionIdGenerator: () => crypto.randomUUID(),
+          enableJsonResponse: true,
+          onsessioninitialized: (id: string) => { sessions.set(id, t); },
+          onsessionclosed: (id: string) => { sessions.delete(id); },
+        });
+        const srv = createMcpServer();
+        await srv.connect(t);
+        transport = t;
+      }
+      return transport.handleRequest(req);
+    },
+  });
+  console.error(`[startup] MCP server (Streamable HTTP) listening on :${httpPort} (POST /mcp)`);
+
+  indexState = 'building';
   await buildIndex();
+  indexState = 'ready';
 
   startWatcher({
     projectRoot,

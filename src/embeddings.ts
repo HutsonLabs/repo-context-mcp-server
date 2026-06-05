@@ -41,6 +41,7 @@ const MODEL_DIMENSIONS: Record<string, number> = {
   'text-embedding-ada-002': 1536,
   'text-embedding-004': 768,
   'nomic-embed-text': 768,
+  'nomic-embed-code': 3584,
   'mxbai-embed-large': 1024,
   'all-minilm': 384,
   'mistral-embed': 1024,
@@ -52,6 +53,7 @@ const PROVIDER_DEFAULT_DIMS: Record<string, number> = {
   ollama: 768,
   mistral: 1024,
   lmstudio: 768,
+  tei: 3584,
 };
 
 export function getDimensions(config: EmbeddingProviderConfig): number {
@@ -139,6 +141,25 @@ async function embedMistral(texts: string[], config: EmbeddingProviderConfig): P
     .map((d) => d.embedding);
 }
 
+async function embedTei(texts: string[], config: EmbeddingProviderConfig): Promise<number[][]> {
+  // HuggingFace Text Embeddings Inference (TEI) exposes an OpenAI-compatible
+  // `/v1/embeddings` endpoint. nomic-embed-code is served this way.
+  let root = config.baseUrl ?? 'http://localhost:8080';
+  root = root.replace(/\/v1\/?$/, '');
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  const res = await fetch(`${root}/v1/embeddings`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ model: config.model, input: texts }),
+  });
+  if (!res.ok) throw new Error(`TEI embedding error ${res.status}: ${await res.text()}`);
+  const data = (await res.json()) as { data: Array<{ index: number; embedding: number[] }> };
+  return data.data
+    .sort((a, b) => a.index - b.index)
+    .map((d) => d.embedding);
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -149,12 +170,38 @@ const BATCH_SIZES: Record<string, number> = {
   openai: 50,
   google: 20,
   mistral: 50,
+  tei: 32,
 };
 
 const MAX_TEXT_CHARS = 4000;
 
 function truncateForEmbedding(text: string): string {
   return text.length > MAX_TEXT_CHARS ? text.slice(0, MAX_TEXT_CHARS) : text;
+}
+
+/**
+ * Apply an asymmetric task prefix to a text based on the embedding model and
+ * whether it is a search query or a document being indexed. Nomic models use
+ * instruction prefixes to distinguish query vs document representations.
+ */
+function applyPrefix(
+  text: string,
+  config: EmbeddingProviderConfig,
+  mode: 'query' | 'document',
+): string {
+  const model = config.model;
+  // nomic-embed-code (and variants) — query gets an instruction, documents none.
+  if (model.includes('nomic-embed-code')) {
+    return mode === 'query'
+      ? `Represent this query for searching relevant code: ${text}`
+      : text;
+  }
+  // nomic-embed-text (and tagged variants like `nomic-embed-text:v1.5`).
+  if (model === 'nomic-embed-text' || model.startsWith('nomic-embed-text:')) {
+    return mode === 'query' ? `search_query: ${text}` : `search_document: ${text}`;
+  }
+  // Any other model: identity.
+  return text;
 }
 
 const PROVIDERS: Record<
@@ -166,17 +213,20 @@ const PROVIDERS: Record<
   ollama: embedOllama,
   lmstudio: embedLmStudio,
   mistral: embedMistral,
+  tei: embedTei,
 };
 
 export async function embedBatch(
   texts: string[],
   config: EmbeddingProviderConfig,
+  mode: 'query' | 'document' = 'document',
 ): Promise<number[][]> {
   const fn = PROVIDERS[config.type];
   if (!fn) throw new Error(`Unknown embedding provider: ${config.type}`);
 
   const batchSize = BATCH_SIZES[config.type] ?? 10;
-  const truncated = texts.map(truncateForEmbedding);
+  // Apply asymmetric task prefixes before truncation, once for the whole batch.
+  const truncated = texts.map((t) => truncateForEmbedding(applyPrefix(t, config, mode)));
 
   const dims = getDimensions(config);
   const results: number[][] = [];
@@ -205,7 +255,8 @@ export async function embedBatch(
 export async function embedSingle(
   text: string,
   config: EmbeddingProviderConfig,
+  mode: 'query' | 'document' = 'query',
 ): Promise<number[]> {
-  const [result] = await embedBatch([text], config);
+  const [result] = await embedBatch([text], config, mode);
   return result;
 }
