@@ -2,7 +2,7 @@
 
 import { watch } from 'chokidar';
 import type { EmbeddingProviderConfig } from './types.js';
-import { indexCode, indexDocs, indexMemory, indexWiki, deleteFileFromTable } from './lancedb.js';
+import { indexCode, indexDocs, indexMemory, indexWiki, deleteFileFromTable } from './db.js';
 import { buildGraph } from './graph.js';
 
 const DEBOUNCE_MS = 5000;

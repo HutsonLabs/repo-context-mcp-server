@@ -1,7 +1,7 @@
 // types.ts — Shared types for repo-context MCP server
 
 export interface EmbeddingProviderConfig {
-  type: 'openai' | 'google' | 'ollama' | 'mistral' | 'lmstudio';
+  type: 'openai' | 'google' | 'ollama' | 'mistral' | 'lmstudio' | 'tei';
   apiKey: string | null;
   baseUrl?: string;
   model: string;
@@ -142,8 +142,12 @@ export interface DependencyGraph {
   typeExports: Record<string, TypeExport[]>;
   /** Type name -> files that import/use it */
   typeConsumers: Record<string, string[]>;
+  /** Qualified symbol "defFile::name" -> files that import/use it */
+  symbolConsumers?: Record<string, string[]>;
   /** Co-change pairs from git history */
   coChanges: CoChangeEntry[];
+  /** Git commit SHA at the time the graph was built */
+  headSha?: string;
 }
 
 // ---------------------------------------------------------------------------
