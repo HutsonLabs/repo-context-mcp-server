@@ -9,7 +9,7 @@ MCP server that gives AI coding assistants deep codebase context through four co
 
 Vectors are stored in **Postgres + pgvector**, static analysis uses the TypeScript AST, and co-change data is mined from git history. The server speaks the **Streamable HTTP** MCP transport and is **multi-repo**: a single database/instance can serve many repositories, each isolated by a `repo_id`. It ships as a Docker Compose stack (server + database) and bootstraps automatically when pointed at a repo.
 
-> **Architecture note (v1.1).** Earlier versions embedded LanceDB and spoke the stdio transport. The server now runs as a long-lived HTTP service backed by Postgres+pgvector. See [How it works](#how-it-works) for details.
+> **Architecture note (v26.6.1).** Earlier versions embedded LanceDB and spoke the stdio transport. The server now runs as a long-lived HTTP service backed by Postgres+pgvector. See [How it works](#how-it-works) for details.
 
 ## Tools
 
