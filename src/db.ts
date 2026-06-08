@@ -1,10 +1,10 @@
 // db.ts — Postgres + pgvector connection, schema management, search.
 //
-// Drop-in replacement for lancedb.ts. Replicates the dedup/prune/upsert
-// semantics and function signatures exactly, so callers (index.ts, watcher.ts)
-// can swap with only an import change. The `indexDir` parameter on the
-// index/search/delete functions is IGNORED (kept for signature compatibility);
-// connection state is established once via initDb().
+// Implements the dedup/prune/upsert semantics over a single pgvector-backed
+// `chunks` table. Connection state (pool + embedding dimension) is established
+// once via initDb() and shared across all repos. Every index/search/delete
+// function takes a `repoId` so one server process can serve many repositories
+// from the same table — rows are always scoped by `repo_id`.
 
 import pg from 'pg';
 import type {
@@ -36,7 +36,6 @@ const MEMORY_SOURCE: Source = 'memory';
 const WIKI_SOURCE: Source = 'wiki';
 
 let pool: pg.Pool | null = null;
-let repoId: string | null = null;
 let dim: number | null = null;
 
 function getPool(): pg.Pool {
@@ -46,20 +45,12 @@ function getPool(): pg.Pool {
   return pool;
 }
 
-function getRepoId(): string {
-  if (repoId == null) {
-    throw new Error('db not initialized: call initDb() before any index/search operation');
-  }
-  return repoId;
-}
-
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
 
 export async function initDb(opts: {
   connectionString: string;
-  repoId: string;
   dim: number;
 }): Promise<void> {
   if (!Number.isInteger(opts.dim) || opts.dim <= 0) {
@@ -67,7 +58,6 @@ export async function initDb(opts: {
   }
 
   pool = new pg.Pool({ connectionString: opts.connectionString });
-  repoId = opts.repoId;
   dim = opts.dim;
 
   const d = opts.dim; // validated positive integer; safe to interpolate into DDL
@@ -127,7 +117,7 @@ interface ChunkInsert {
 
 export async function indexCode(
   projectRoot: string,
-  _indexDir: string,
+  repoId: string,
   config: EmbeddingProviderConfig,
   codePatterns: string[],
   skipPatterns: string[],
@@ -143,12 +133,12 @@ export async function indexCode(
 
   console.error(`[index] Found ${files.length} code files`);
 
-  const pruned = await pruneDeletedFiles(CODE_SOURCE, new Set(files));
+  const pruned = await pruneDeletedFiles(repoId, CODE_SOURCE, new Set(files));
   if (pruned > 0) {
     console.error(`[index] Pruned ${pruned} deleted code file(s) from index`);
   }
 
-  const existing = await getExistingHashes(CODE_SOURCE);
+  const existing = await getExistingHashes(repoId, CODE_SOURCE);
 
   const rows: Array<Omit<ChunkInsert, 'vector'>> = [];
   const texts: string[] = [];
@@ -195,14 +185,14 @@ export async function indexCode(
 
   const fullRows: ChunkInsert[] = rows.map((row, i) => ({ ...row, vector: vectors[i] }));
 
-  await upsertRows(CODE_SOURCE, fullRows);
+  await upsertRows(repoId, CODE_SOURCE, fullRows);
   console.error(`[index] Indexed ${fullRows.length} code chunks`);
   return fullRows.length;
 }
 
 export async function indexDocs(
   projectRoot: string,
-  _indexDir: string,
+  repoId: string,
   config: EmbeddingProviderConfig,
   docPatterns: string[],
 ): Promise<number> {
@@ -213,12 +203,12 @@ export async function indexDocs(
     }
   }
 
-  const prunedDocs = await pruneDeletedFiles(DOCS_SOURCE, new Set(docPaths));
+  const prunedDocs = await pruneDeletedFiles(repoId, DOCS_SOURCE, new Set(docPaths));
   if (prunedDocs > 0) {
     console.error(`[index] Pruned ${prunedDocs} deleted doc file(s) from index`);
   }
 
-  const existing = await getExistingHashes(DOCS_SOURCE);
+  const existing = await getExistingHashes(repoId, DOCS_SOURCE);
   const rows: Array<Omit<ChunkInsert, 'vector'>> = [];
   const texts: string[] = [];
 
@@ -264,14 +254,14 @@ export async function indexDocs(
 
   const fullRows: ChunkInsert[] = rows.map((row, i) => ({ ...row, vector: vectors[i] }));
 
-  await upsertRows(DOCS_SOURCE, fullRows);
+  await upsertRows(repoId, DOCS_SOURCE, fullRows);
   console.error(`[index] Indexed ${fullRows.length} doc chunks`);
   return fullRows.length;
 }
 
 export async function indexMemory(
   memoryDir: string,
-  _indexDir: string,
+  repoId: string,
   config: EmbeddingProviderConfig,
 ): Promise<number> {
   let entries: string[];
@@ -282,12 +272,12 @@ export async function indexMemory(
     return 0;
   }
 
-  const prunedMem = await pruneDeletedFiles(MEMORY_SOURCE, new Set(entries));
+  const prunedMem = await pruneDeletedFiles(repoId, MEMORY_SOURCE, new Set(entries));
   if (prunedMem > 0) {
     console.error(`[index] Pruned ${prunedMem} deleted memory file(s) from index`);
   }
 
-  const existing = await getExistingHashes(MEMORY_SOURCE);
+  const existing = await getExistingHashes(repoId, MEMORY_SOURCE);
   const rows: Array<Omit<ChunkInsert, 'vector'>> = [];
   const texts: string[] = [];
 
@@ -331,14 +321,14 @@ export async function indexMemory(
 
   const fullRows: ChunkInsert[] = rows.map((row, i) => ({ ...row, vector: vectors[i] }));
 
-  await upsertRows(MEMORY_SOURCE, fullRows);
+  await upsertRows(repoId, MEMORY_SOURCE, fullRows);
   console.error(`[index] Indexed ${fullRows.length} memory chunks`);
   return fullRows.length;
 }
 
 export async function indexWiki(
   wikiDir: string,
-  _indexDir: string,
+  repoId: string,
   config: EmbeddingProviderConfig,
 ): Promise<number> {
   let entries: string[];
@@ -349,12 +339,12 @@ export async function indexWiki(
     return 0;
   }
 
-  const prunedWiki = await pruneDeletedFiles(WIKI_SOURCE, new Set(entries));
+  const prunedWiki = await pruneDeletedFiles(repoId, WIKI_SOURCE, new Set(entries));
   if (prunedWiki > 0) {
     console.error(`[index] Pruned ${prunedWiki} deleted wiki file(s) from index`);
   }
 
-  const existing = await getExistingHashes(WIKI_SOURCE);
+  const existing = await getExistingHashes(repoId, WIKI_SOURCE);
   const rows: Array<Omit<ChunkInsert, 'vector'>> = [];
   const texts: string[] = [];
 
@@ -400,7 +390,7 @@ export async function indexWiki(
 
   const fullRows: ChunkInsert[] = rows.map((row, i) => ({ ...row, vector: vectors[i] }));
 
-  await upsertRows(WIKI_SOURCE, fullRows);
+  await upsertRows(repoId, WIKI_SOURCE, fullRows);
   console.error(`[index] Indexed ${fullRows.length} wiki chunks`);
   return fullRows.length;
 }
@@ -412,7 +402,7 @@ export async function indexWiki(
 export async function searchCode(
   query: string,
   config: EmbeddingProviderConfig,
-  _indexDir: string,
+  repoId: string,
   k: number = 5,
   fileFilter?: string,
 ): Promise<CodeSearchResult[]> {
@@ -427,7 +417,7 @@ export async function searchCode(
       WHERE repo_id = $2 AND source = $3
       ORDER BY embedding <=> $1::vector
       LIMIT ${limit}`,
-    [vecLiteral, getRepoId(), CODE_SOURCE],
+    [vecLiteral, repoId, CODE_SOURCE],
   );
 
   let filtered = rows;
@@ -448,7 +438,7 @@ export async function searchCode(
 export async function searchDocs(
   query: string,
   config: EmbeddingProviderConfig,
-  _indexDir: string,
+  repoId: string,
   k: number = 3,
 ): Promise<DocsSearchResult[]> {
   const queryVec = await embedSingle(query, config, 'query');
@@ -461,7 +451,7 @@ export async function searchDocs(
       WHERE repo_id = $2 AND source = $3
       ORDER BY embedding <=> $1::vector
       LIMIT ${k}`,
-    [vecLiteral, getRepoId(), DOCS_SOURCE],
+    [vecLiteral, repoId, DOCS_SOURCE],
   );
 
   return rows.map((r: any) => ({
@@ -475,7 +465,7 @@ export async function searchDocs(
 export async function searchMemory(
   query: string,
   config: EmbeddingProviderConfig,
-  _indexDir: string,
+  repoId: string,
   k: number = 3,
   typeFilter?: string,
 ): Promise<MemorySearchResult[]> {
@@ -483,7 +473,7 @@ export async function searchMemory(
   const vecLiteral = toVectorLiteral(queryVec);
 
   const limit = typeFilter ? k * 3 : k;
-  const params: unknown[] = [vecLiteral, getRepoId(), MEMORY_SOURCE];
+  const params: unknown[] = [vecLiteral, repoId, MEMORY_SOURCE];
   let typeClause = '';
   if (typeFilter) {
     params.push(typeFilter);
@@ -518,7 +508,7 @@ export async function searchMemory(
 export async function searchWiki(
   query: string,
   config: EmbeddingProviderConfig,
-  _indexDir: string,
+  repoId: string,
   k: number = 3,
 ): Promise<WikiSearchResult[]> {
   const queryVec = await embedSingle(query, config, 'query');
@@ -531,7 +521,7 @@ export async function searchWiki(
       WHERE repo_id = $2 AND source = $3
       ORDER BY embedding <=> $1::vector
       LIMIT ${k}`,
-    [vecLiteral, getRepoId(), WIKI_SOURCE],
+    [vecLiteral, repoId, WIKI_SOURCE],
   );
 
   return rows.map((r: any) => ({
@@ -563,11 +553,11 @@ function toVectorLiteral(vec: number[]): string {
   return '[' + vec.join(',') + ']';
 }
 
-async function getExistingHashes(source: Source): Promise<Map<string, string>> {
+async function getExistingHashes(repoId: string, source: Source): Promise<Map<string, string>> {
   const map = new Map<string, string>();
   const { rows } = await getPool().query(
     `SELECT file_path, content_hash FROM chunks WHERE repo_id = $1 AND source = $2`,
-    [getRepoId(), source],
+    [repoId, source],
   );
   for (const row of rows as Array<{ file_path: string; content_hash: string }>) {
     map.set(row.file_path, row.content_hash);
@@ -575,10 +565,10 @@ async function getExistingHashes(source: Source): Promise<Map<string, string>> {
   return map;
 }
 
-async function upsertRows(source: Source, rows: ChunkInsert[]): Promise<void> {
+async function upsertRows(repoId: string, source: Source, rows: ChunkInsert[]): Promise<void> {
   if (rows.length === 0) return;
 
-  const rid = getRepoId();
+  const rid = repoId;
   const client = await getPool().connect();
   try {
     await client.query('BEGIN');
@@ -661,8 +651,8 @@ async function upsertRows(source: Source, rows: ChunkInsert[]): Promise<void> {
 // Remove all rows for files that are no longer present on disk. Runs on every
 // re-index so deletions made while the server was dead (or that chokidar
 // missed) get cleaned up. Returns the number of distinct file paths pruned.
-async function pruneDeletedFiles(source: Source, presentFiles: Set<string>): Promise<number> {
-  const rid = getRepoId();
+async function pruneDeletedFiles(repoId: string, source: Source, presentFiles: Set<string>): Promise<number> {
+  const rid = repoId;
   const { rows } = await getPool().query(
     `SELECT DISTINCT file_path FROM chunks WHERE repo_id = $1 AND source = $2`,
     [rid, source],
@@ -687,12 +677,12 @@ async function pruneDeletedFiles(source: Source, presentFiles: Set<string>): Pro
 // Remove rows for a single file path. Used by the watcher's unlink handler
 // to reflect deletions immediately (before the debounced re-index fires).
 export async function deleteFileFromTable(
-  _indexDir: string,
+  repoId: string,
   tableName: 'code' | 'docs' | 'memory' | 'wiki',
   filePath: string,
 ): Promise<void> {
   await getPool().query(
     `DELETE FROM chunks WHERE repo_id = $1 AND source = $2 AND file_path = $3`,
-    [getRepoId(), tableName, filePath],
+    [repoId, tableName, filePath],
   );
 }

@@ -9,7 +9,7 @@ MCP server that gives AI coding assistants deep codebase context through four co
 
 Vectors are stored in **Postgres + pgvector**, static analysis uses the TypeScript AST, and co-change data is mined from git history. The server speaks the **Streamable HTTP** MCP transport and is **multi-repo**: a single database/instance can serve many repositories, each isolated by a `repo_id`. It ships as a Docker Compose stack (server + database) and bootstraps automatically when pointed at a repo.
 
-> **Architecture note (v26.6.1).** Earlier versions embedded LanceDB and spoke the stdio transport. The server now runs as a long-lived HTTP service backed by Postgres+pgvector. See [How it works](#how-it-works) for details.
+> **Architecture note (v26.06.1).** Earlier versions embedded LanceDB and spoke the stdio transport. The server now runs as a long-lived HTTP service backed by Postgres+pgvector. See [How it works](#how-it-works) for details.
 
 ## Tools
 
@@ -87,6 +87,32 @@ claude mcp add --transport http repo-context http://localhost:3333/mcp
 
 Then restart Claude Code. The tools above become available as `repo-context` MCP tools. Searches return empty until `/health` reports `"index":"ready"`.
 
+### Selecting a repo (`X-Repo-Id`)
+
+One server can serve many repositories. A client says which repo a request
+targets with the **`X-Repo-Id`** header, set per project in `.mcp.json` (or in
+your user settings). The repo named must exist in the server's `repos` config
+(see [Multiple repositories](#multiple-repositories)).
+
+```jsonc
+// .mcp.json — same server, the header picks the repo
+{
+  "mcpServers": {
+    "repo-context": {
+      "type": "http",
+      "url": "http://localhost:3333/mcp",
+      "headers": { "X-Repo-Id": "pegasus" }
+    }
+  }
+}
+```
+
+With a single configured repo, the header is optional (that repo is the
+default). With several, it is required — a request without it gets `400` listing
+the available repos, and an unknown id gets `404`. A `/mcp/<repoId>` path
+segment is also accepted as a fallback (handy for `curl`), but the header is the
+intended contract.
+
 ## Run locally without Docker
 
 The server requires a reachable Postgres with the `pgvector` extension. With one available, run it directly with [Bun](https://bun.sh):
@@ -119,9 +145,13 @@ Container/runtime settings (override the defaults shown):
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/repo_context` | Postgres connection string (needs the `vector` extension; the server runs `CREATE EXTENSION IF NOT EXISTS vector`). |
-| `REPO_ID` | `default` | Logical id that isolates this repo's rows in the shared `chunks` table. Use a distinct value per repo when sharing one database. |
-| `PROJECT_ROOT` | `process.cwd()` | Absolute path to the repository to index. In Docker this is `/workspace`. |
+| `REPO_ID` | `default` | **Single-repo fallback only.** Logical id for the lone repo synthesized when the config has no `repos` array. Ignored when `repos` is set (each entry carries its own `repoId`). Clients select a repo at request time via the `X-Repo-Id` header. |
+| `PROJECT_ROOT` | `process.cwd()` | **Single-repo fallback only.** Absolute path to the lone repo to index (Docker: `/workspace`). Ignored when `repos` is set. |
 | `PORT` | `3000` | HTTP port the server listens on (`POST /mcp`, `GET /health`). |
+
+> Multi-repo selection is **per request** (`X-Repo-Id` header), not per env var.
+> `REPO_ID`/`PROJECT_ROOT` only configure the single-repo fallback. See
+> [Multiple repositories](#multiple-repositories).
 
 ### Config file
 
@@ -164,13 +194,53 @@ All fields except `embedding` are optional:
 | `codePatterns` | `["**/*.{ts,tsx,js,jsx}"]` | Glob patterns for source code files |
 | `docPatterns` | `["docs/*.md", "CLAUDE.md", ".claude/rules/*.md"]` | Glob patterns for documentation files |
 | `skipPatterns` | node_modules, .next, dist, build, tests, mocks | Substrings in file paths to skip |
-| `projectRoot` | `PROJECT_ROOT` env / `process.cwd()` | Override project root |
+| `projectRoot` | `PROJECT_ROOT` env / `process.cwd()` | Override project root (single-repo fallback) |
 | `memoryDir` | auto-detected | Override Claude Code memory directory |
+| `repos` | (unset) | Array of repositories to serve. When present, the server runs multi-repo and ignores `projectRoot`/`REPO_ID`. See [Multiple repositories](#multiple-repositories). |
 | `graph.coChangeMinCount` | `3` | Minimum co-occurrence count to record a co-change pair |
 | `graph.coChangeMaxCommits` | `500` | How many commits to scan for co-change analysis |
 | `wiki.autoInit` | `true` | Create wiki directory and index/log files on first run |
 
 > The embedding **dimension is derived from the model** (e.g. `nomic-embed-text` → 768, `nomic-embed-code` → 3584) and fixes the `vector(N)` column width at first run. Changing models against an existing database requires a fresh `repo_id` or a reset of the `chunks` table.
+
+### Multiple repositories
+
+One server instance can index and serve many repositories, isolated by
+`repo_id` in the shared `chunks` table. Add a `repos` array to the config — each
+entry is a `repoId` plus the `projectRoot` to index, and may override any of the
+per-repo fields (`memoryDir`, `codePatterns`, `docPatterns`, `skipPatterns`,
+`graph`, `wiki`); anything omitted inherits the server-level value.
+
+```json
+{
+  "embedding": { "type": "ollama", "apiKey": null, "baseUrl": "http://host.docker.internal:11434", "model": "nomic-embed-text" },
+  "repos": [
+    { "repoId": "pegasus", "projectRoot": "/repos/pegasus" },
+    { "repoId": "iceberg", "projectRoot": "/repos/iceberg" }
+  ]
+}
+```
+
+A ready-to-edit copy lives at `config.multi-repo.example.json`. Clients then
+select a repo per request via the [`X-Repo-Id`](#selecting-a-repo-x-repo-id)
+header, and `GET /health` reports each repo's index state:
+
+```json
+{ "status": "ok", "index": "ready", "repos": { "pegasus": "ready", "iceberg": "building" } }
+```
+
+In Docker, mount each repo where its `projectRoot` points and supply the config
+without rebuilding the image (it is bind-mounted to `/app/config.json`):
+
+```sh
+REPO_CONFIG=./config.multi-repo.example.json REPOS_DIR=/abs/parent/of/repos \
+  docker compose up --build   # after uncommenting the /repos mount in docker-compose.yml
+```
+
+> **One embedding model per server.** All repos share a single `chunks` table
+> and therefore a single `vector(N)` width, so every repo must use the same
+> server-level `embedding` model. Per-repo models would need separate tables and
+> are not supported.
 
 ## Embedding providers
 
@@ -218,11 +288,11 @@ Always use the repo-context MCP tools **first** when exploring the codebase — 
 
 ### Multi-repo isolation
 
-Every row carries a `repo_id`. One database (and one server, via per-session HTTP transports) can serve many repositories simultaneously — searches, indexing, and pruning are always scoped to the configured `REPO_ID`.
+Every row carries a `repo_id`. One database **and one server** can serve many repositories simultaneously: each is declared in the `repos` config, indexed and watched independently, and a request selects which one via the `X-Repo-Id` header. Searches, indexing, and pruning are always scoped to that repo's `repo_id`, so repos never see each other's rows.
 
 ### Transport
 
-The server is a long-lived process exposing **Streamable HTTP** at `POST /mcp`. Each MCP session gets its own transport and `McpServer` instance, routed by the `mcp-session-id` header. `GET /health` reports liveness and index state (`starting` → `building` → `ready`). The server begins accepting connections before the initial index completes.
+The server is a long-lived process exposing **Streamable HTTP** at `POST /mcp`. Each MCP session gets its own transport and `McpServer` instance, bound at initialization to the repo resolved from the `X-Repo-Id` header (or `/mcp/<repoId>` path fallback), and thereafter routed by the `mcp-session-id` header. `GET /health` reports liveness and per-repo index state (`starting` → `building` → `ready`). The server begins accepting connections before the initial index completes.
 
 ### Dependency graph
 

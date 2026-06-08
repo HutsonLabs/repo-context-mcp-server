@@ -86,7 +86,7 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
     // Pre-clean in case a previous crashed run left rows behind.
     await probe.query(`DELETE FROM chunks WHERE repo_id = $1`, [REPO_ID]).catch(() => {});
 
-    await initDb({ connectionString: DB_URL!, repoId: REPO_ID, dim: DIM });
+    await initDb({ connectionString: DB_URL!, dim: DIM });
 
     projectRoot = mkdtempSync(join(tmpdir(), 'rc-db-test-'));
   });
@@ -120,7 +120,7 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
     writeProjectFile('alpha.ts', `export function alpha() { return 'alpha'; }\n`);
     writeProjectFile('beta.ts', `export const beta = 42;\nexport function useBeta() { return beta; }\n`);
 
-    const n = await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+    const n = await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
     expect(n).toBeGreaterThan(0);
     expect(await countRows('code')).toBe(n);
     expect(await countRows('code', 'alpha.ts')).toBeGreaterThan(0);
@@ -128,7 +128,7 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
 
   test('re-indexing unchanged files is a no-op (content-hash dedup)', async () => {
     const before = await countRows('code');
-    const n = await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+    const n = await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
     expect(n).toBe(0);
     expect(await countRows('code')).toBe(before);
   });
@@ -136,11 +136,11 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
   test('modifying a file replaces its chunks (upsert), not duplicates them', async () => {
     writeProjectFile('alpha.ts', `export function alpha() { return 'ALPHA-v2'; }\n`);
 
-    const n = await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+    const n = await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
     expect(n).toBeGreaterThan(0);
 
     // Old content gone, new content present; beta.ts untouched.
-    const results = await searchCode('alpha', config, projectRoot, 20);
+    const results = await searchCode('alpha', config, REPO_ID, 20);
     const alphaChunks = results.filter((r) => r.file === 'alpha.ts');
     expect(alphaChunks.length).toBeGreaterThan(0);
     const text = alphaChunks.map((r) => r.chunk).join('\n');
@@ -152,7 +152,7 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
     expect(await countRows('code', 'beta.ts')).toBeGreaterThan(0);
 
     rmSync(join(projectRoot, 'beta.ts'));
-    await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+    await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
 
     expect(await countRows('code', 'beta.ts')).toBe(0);
     expect(await countRows('code', 'alpha.ts')).toBeGreaterThan(0);
@@ -160,21 +160,21 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
 
   test('searchCode round-trips and respects the file_filter glob', async () => {
     writeProjectFile('sub/gamma.ts', `export function gamma() { return 'gamma'; }\n`);
-    await indexCode(projectRoot, projectRoot, config, ['**/*.ts'], ['node_modules']);
+    await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
 
-    const all = await searchCode('function', config, projectRoot, 20);
+    const all = await searchCode('function', config, REPO_ID, 20);
     const files = new Set(all.map((r) => r.file));
     expect(files.has('sub/gamma.ts')).toBe(true);
     expect(files.has('alpha.ts')).toBe(true);
 
-    const scoped = await searchCode('function', config, projectRoot, 20, 'sub/**');
+    const scoped = await searchCode('function', config, REPO_ID, 20, 'sub/**');
     expect(scoped.length).toBeGreaterThan(0);
     expect(scoped.every((r) => r.file.startsWith('sub/'))).toBe(true);
   });
 
   test('deleteFileFromTable removes a single file immediately', async () => {
     expect(await countRows('code', 'sub/gamma.ts')).toBeGreaterThan(0);
-    await deleteFileFromTable(projectRoot, 'code', 'sub/gamma.ts');
+    await deleteFileFromTable(REPO_ID, 'code', 'sub/gamma.ts');
     expect(await countRows('code', 'sub/gamma.ts')).toBe(0);
     // Sibling rows are untouched.
     expect(await countRows('code', 'alpha.ts')).toBeGreaterThan(0);
@@ -185,5 +185,35 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
       `SELECT DISTINCT repo_id FROM chunks WHERE source = 'code' AND file_path = 'alpha.ts'`,
     );
     expect(rows.map((r) => r.repo_id)).toContain(REPO_ID);
+  });
+
+  test('two repos sharing one db/table do not see each other\'s rows', async () => {
+    const REPO_B = `${REPO_ID}_b`;
+    const rootB = mkdtempSync(join(tmpdir(), 'rc-db-test-b-'));
+    try {
+      // Same relative filename in both repos, different contents.
+      writeFileSync(join(projectRoot, 'shared.ts'), `export const fromA = 'AAA';\n`);
+      writeFileSync(join(rootB, 'shared.ts'), `export const fromB = 'BBB';\n`);
+
+      await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
+      await indexCode(rootB, REPO_B, config, ['**/*.ts'], ['node_modules']);
+
+      // Each repo's search only surfaces its own content for the shared path.
+      const fromA = (await searchCode('shared', config, REPO_ID, 20)).filter((r) => r.file === 'shared.ts');
+      const fromB = (await searchCode('shared', config, REPO_B, 20)).filter((r) => r.file === 'shared.ts');
+
+      expect(fromA.map((r) => r.chunk).join('\n')).toContain('AAA');
+      expect(fromA.map((r) => r.chunk).join('\n')).not.toContain('BBB');
+      expect(fromB.map((r) => r.chunk).join('\n')).toContain('BBB');
+      expect(fromB.map((r) => r.chunk).join('\n')).not.toContain('AAA');
+
+      // Pruning repo B leaves repo A's row for the same path intact.
+      rmSync(join(rootB, 'shared.ts'));
+      await indexCode(rootB, REPO_B, config, ['**/*.ts'], ['node_modules']);
+      expect(await countRows('code', 'shared.ts')).toBeGreaterThan(0); // A still present (countRows scopes to REPO_ID)
+    } finally {
+      await probe!.query(`DELETE FROM chunks WHERE repo_id = $1`, [REPO_B]).catch(() => {});
+      rmSync(rootB, { recursive: true, force: true });
+    }
   });
 });

@@ -19,9 +19,44 @@ export interface WikiConfig {
   autoInit?: boolean;
 }
 
+/**
+ * One indexed repository in a multi-repo server. A client selects which repo a
+ * request targets via the `X-Repo-Id` header; the server scopes all rows by
+ * `repoId`. Indexing patterns/paths may be overridden per repo, otherwise the
+ * server-level defaults apply.
+ */
+export interface RepoConfig {
+  /** Logical id that isolates this repo's rows in the shared `chunks` table. */
+  repoId: string;
+  /** Absolute path to this repo's project root (the mounted source tree). */
+  projectRoot: string;
+  /** Absolute path to this repo's memory directory (auto-detected if omitted). */
+  memoryDir?: string;
+  /** Per-repo override of source code globs (falls back to server `codePatterns`). */
+  codePatterns?: string[];
+  /** Per-repo override of doc globs (falls back to server `docPatterns`). */
+  docPatterns?: string[];
+  /** Per-repo override of skip substrings (falls back to server `skipPatterns`). */
+  skipPatterns?: string[];
+  /** Per-repo override of dependency-graph settings. */
+  graph?: GraphConfig;
+  /** Per-repo override of wiki settings. */
+  wiki?: WikiConfig;
+}
+
 export interface ServerConfig {
   embedding: EmbeddingProviderConfig;
-  /** Absolute path to project root (defaults to process.cwd()) */
+  /**
+   * Repositories served by this instance. A request picks one via the
+   * `X-Repo-Id` header. When omitted, the server synthesizes a single repo
+   * from the `PROJECT_ROOT` / `REPO_ID` env vars (single-repo back-compat),
+   * which is also the default when a request sends no `X-Repo-Id`.
+   *
+   * NOTE: all repos share one `chunks` table and therefore one embedding
+   * dimension — every repo must use the same server-level `embedding` model.
+   */
+  repos?: RepoConfig[];
+  /** Absolute path to project root (defaults to process.cwd()) — single-repo fallback. */
   projectRoot?: string;
   /** Absolute path to memory directory (auto-detected from project path if omitted) */
   memoryDir?: string;

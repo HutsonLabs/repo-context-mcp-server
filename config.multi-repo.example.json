@@ -2,7 +2,7 @@
   "embedding": {
     "type": "ollama",
     "apiKey": null,
-    "baseUrl": "http://localhost:11434",
+    "baseUrl": "http://host.docker.internal:11434",
     "model": "nomic-embed-text"
   },
   "codePatterns": ["**/*.{ts,tsx,js,jsx}"],
@@ -12,11 +12,11 @@
     ".bundle.", ".min.", "__tests__", "__mocks__",
     ".claude/worktrees", ".repo-context"
   ],
-  "graph": {
-    "coChangeMinCount": 3,
-    "coChangeMaxCommits": 500
-  },
-  "wiki": {
-    "autoInit": true
-  }
+  "graph": { "coChangeMinCount": 3, "coChangeMaxCommits": 500 },
+  "wiki": { "autoInit": true },
+
+  "repos": [
+    { "repoId": "pegasus", "projectRoot": "/repos/pegasus" },
+    { "repoId": "iceberg", "projectRoot": "/repos/iceberg" }
+  ]
 }
