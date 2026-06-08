@@ -11,6 +11,8 @@ Vectors are stored in a single local **sqlite** file via the **[sqlite-vec](http
 
 > **Architecture note (v26.06.2).** The server is local-only again: stdio transport + an embedded sqlite/sqlite-vec store, replacing the prior HTTP-over-Postgres+pgvector deployment. (An even earlier version used LanceDB; sqlite-vec now fills that role and also holds the graph.) See [How it works](#how-it-works) for details.
 
+> **New here?** Read the [docs](./docs/) — a [getting-started guide](./docs/getting-started.md) (install, connect, and a tool-by-tool playbook) and [why semantic-driven context](./docs/why-semantic-driven-context.md) (why pairing meaning-first retrieval with a verified structural graph makes coding agents more reliable). This README is the reference; the docs are the guide.
+
 ## Tools
 
 ### Search (vector-based)
