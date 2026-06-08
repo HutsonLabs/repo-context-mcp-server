@@ -7,9 +7,9 @@ MCP server that gives AI coding assistants deep codebase context through four co
 3. **LLM Wiki** — AI-maintained knowledge base for decisions and tribal knowledge
 4. **Partition scheduler** — Computes which issues can be worked in parallel without file conflicts
 
-Vectors are stored in **Postgres + pgvector**, static analysis uses the TypeScript AST, and co-change data is mined from git history. The server speaks the **Streamable HTTP** MCP transport and is **multi-repo**: a single database/instance can serve many repositories, each isolated by a `repo_id`. It ships as a Docker Compose stack (server + database) and bootstraps automatically when pointed at a repo.
+Vectors are stored in a single local **sqlite** file via the **[sqlite-vec](https://github.com/asg017/sqlite-vec)** extension, static analysis uses the TypeScript AST, and co-change data is mined from git history. The server runs as a **local stdio MCP server** — one process per repository, spoken over stdin/stdout — with **no docker, no Postgres, and no network listener**. Everything (chunk embeddings + the dependency graph) lives in `.repo-context/index.db` inside the indexed repo. Embeddings are produced by a host embedder (Ollama by default).
 
-> **Architecture note (v26.06.1).** Earlier versions embedded LanceDB and spoke the stdio transport. The server now runs as a long-lived HTTP service backed by Postgres+pgvector. See [How it works](#how-it-works) for details.
+> **Architecture note (v26.06.2).** The server is local-only again: stdio transport + an embedded sqlite/sqlite-vec store, replacing the prior HTTP-over-Postgres+pgvector deployment. (An even earlier version used LanceDB; sqlite-vec now fills that role and also holds the graph.) See [How it works](#how-it-works) for details.
 
 ## Tools
 
@@ -36,122 +36,82 @@ Vectors are stored in **Postgres + pgvector**, static analysis uses the TypeScri
 
 - **partition** — Given per-issue "touch sets" (the files each issue plans to modify), compute a conflict graph and a deterministic wave schedule of which issues can run in parallel. See [Partition scheduler](#partition-scheduler).
 
-## Quick start (Docker Compose)
+## Quick start
 
-The recommended way to run the server is the bundled Compose stack, which starts Postgres (with the pgvector extension) and the MCP server together.
+The server runs locally with [Bun](https://bun.sh) and speaks the stdio MCP
+transport — Claude Code (or any MCP client) launches it as a child process.
 
 ### Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/) with Compose v2
-- An embedding provider reachable from the container. The default `config.docker.json` targets **host [Ollama](https://ollama.com)**, so it runs GPU-free:
+- [Bun](https://bun.sh) — `curl -fsSL https://bun.sh/install | bash`
+- An **extension-capable sqlite**. macOS ships a libsqlite3 with extension
+  loading compiled out, so install one Bun can load `sqlite-vec` into:
 
   ```sh
-  # macOS
-  brew install ollama
-  ollama serve                     # runs on http://localhost:11434
-  ollama pull nomic-embed-text     # 768-dim embeddings
+  brew install sqlite        # macOS — used automatically via Database.setCustomSQLite()
   ```
 
-  The container reaches host Ollama via `host.docker.internal` (configured in `docker-compose.yml`).
+  Auto-detected at `/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib` (Apple
+  Silicon) or `/usr/local/...` (Intel). Override with `REPO_CONTEXT_SQLITE`.
+  On Linux the bundled sqlite usually loads extensions and no install is needed.
+- A host **embedder**. The default config targets [Ollama](https://ollama.com):
+
+  ```sh
+  brew install ollama
+  ollama serve                     # http://localhost:11434
+  ollama pull nomic-embed-text     # 768-dim embeddings
+  ```
 
 ### Run
 
 ```sh
-# Index the current directory (defaults to "." — override with INDEX_REPO)
-INDEX_REPO=/path/to/your/project docker compose up --build
+bun install
+cd /path/to/your/project          # the repo to index (holds repo-context.json)
+bun run /path/to/repo-context-mcp-server/src/index.ts
 ```
 
-This brings up:
-
-| Service | Purpose | Host port |
-|---|---|---|
-| `db` | Postgres 17 + pgvector | `5433` (debugging only) |
-| `mcp` | MCP server (Streamable HTTP) | `3333` → `POST /mcp` |
-
-The server starts serving immediately and builds the index in the background. Check readiness:
-
-```sh
-curl localhost:3333/health
-# {"status":"ok","index":"building"}  -> later: {"status":"ok","index":"ready"}
-```
-
-The indexed repo is bind-mounted at `/workspace` (read-write, so `.repo-context/` and the wiki can be written back).
+The process speaks JSON-RPC on stdin/stdout (logs go to stderr). It answers the
+`initialize` handshake immediately and builds the index in the background;
+searches return empty until that first build finishes. The store is written to
+`<project>/.repo-context/index.db`.
 
 ## Connect Claude Code
 
-Point Claude Code at the HTTP endpoint:
-
-```sh
-claude mcp add --transport http repo-context http://localhost:3333/mcp
-```
-
-Then restart Claude Code. The tools above become available as `repo-context` MCP tools. Searches return empty until `/health` reports `"index":"ready"`.
-
-### Selecting a repo (`X-Repo-Id`)
-
-One server can serve many repositories. A client says which repo a request
-targets with the **`X-Repo-Id`** header, set per project in `.mcp.json` (or in
-your user settings). The repo named must exist in the server's `repos` config
-(see [Multiple repositories](#multiple-repositories)).
+Add a stdio server entry to the project's `.mcp.json`:
 
 ```jsonc
-// .mcp.json — same server, the header picks the repo
+// <project>/.mcp.json
 {
   "mcpServers": {
     "repo-context": {
-      "type": "http",
-      "url": "http://localhost:3333/mcp",
-      "headers": { "X-Repo-Id": "pegasus" }
+      "type": "stdio",
+      "command": "bun",
+      "args": ["run", "/path/to/repo-context-mcp-server/src/index.ts"]
     }
   }
 }
 ```
 
-With a single configured repo, the header is optional (that repo is the
-default). With several, it is required — a request without it gets `400` listing
-the available repos, and an unknown id gets `404`. A `/mcp/<repoId>` path
-segment is also accepted as a fallback (handy for `curl`), but the header is the
-intended contract.
+Claude Code launches the server with the project directory as its working
+directory, so config resolution (`<cwd>/repo-context.json`) and the default
+project root both point at the repo being worked on. Restart Claude Code and the
+tools above become available as `repo-context` MCP tools.
 
-## Run locally without Docker
-
-The server requires a reachable Postgres with the `pgvector` extension. With one available, run it directly with [Bun](https://bun.sh):
-
-```sh
-curl -fsSL https://bun.sh/install | bash   # install Bun
-bun install
-
-DATABASE_URL="postgres://postgres:postgres@localhost:5432/repo_context" \
-REPO_ID="my-project" \
-PROJECT_ROOT="/path/to/your/project" \
-PORT=3000 \
-bun run src/index.ts
-```
-
-A throwaway pgvector database for local development:
-
-```sh
-docker run -d --name repo-context-db -p 5432:5432 \
-  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=repo_context \
-  pgvector/pgvector:pg17
-```
+> **One process per repo.** A stdio server serves a single repository. To index
+> several, run one server per project (each project's `.mcp.json` launches its
+> own). The `repos` config array is still honored; with more than one entry, set
+> the `REPO_ID` env var to pick which one this process serves (the first entry
+> otherwise).
 
 ## Configuration
 
 ### Environment variables
 
-Container/runtime settings (override the defaults shown):
-
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/repo_context` | Postgres connection string (needs the `vector` extension; the server runs `CREATE EXTENSION IF NOT EXISTS vector`). |
-| `REPO_ID` | `default` | **Single-repo fallback only.** Logical id for the lone repo synthesized when the config has no `repos` array. Ignored when `repos` is set (each entry carries its own `repoId`). Clients select a repo at request time via the `X-Repo-Id` header. |
-| `PROJECT_ROOT` | `process.cwd()` | **Single-repo fallback only.** Absolute path to the lone repo to index (Docker: `/workspace`). Ignored when `repos` is set. |
-| `PORT` | `3000` | HTTP port the server listens on (`POST /mcp`, `GET /health`). |
-
-> Multi-repo selection is **per request** (`X-Repo-Id` header), not per env var.
-> `REPO_ID`/`PROJECT_ROOT` only configure the single-repo fallback. See
-> [Multiple repositories](#multiple-repositories).
+| `REPO_ID` | `default` | Logical id isolating this repo's rows in the sqlite store. With a multi-entry `repos` config, selects which configured repo this process serves. |
+| `PROJECT_ROOT` | `process.cwd()` | Absolute path to the repo to index. Defaults to the launch directory. Ignored when `repos` is set. |
+| `REPO_CONTEXT_SQLITE` | auto-detect (Homebrew) | Path to a libsqlite3 that supports `loadExtension`, used to load `sqlite-vec`. Only needed if auto-detection misses. |
 
 ### Config file
 
@@ -159,7 +119,7 @@ Indexing behavior is controlled by a JSON config. Resolution order (first found 
 
 1. `<cwd>/repo-context.json`
 2. `<cwd>/.repo-context/config.json`
-3. `<server-dir>/config.json` (the Docker image copies `config.docker.json` here)
+3. `<server-dir>/config.json`
 
 All fields except `embedding` are optional:
 
@@ -205,42 +165,32 @@ All fields except `embedding` are optional:
 
 ### Multiple repositories
 
-One server instance can index and serve many repositories, isolated by
-`repo_id` in the shared `chunks` table. Add a `repos` array to the config — each
-entry is a `repoId` plus the `projectRoot` to index, and may override any of the
-per-repo fields (`memoryDir`, `codePatterns`, `docPatterns`, `skipPatterns`,
-`graph`, `wiki`); anything omitted inherits the server-level value.
+A stdio server serves **one repository per process**, but the config may still
+declare several so the same file can drive multiple per-project launches. Add a
+`repos` array — each entry is a `repoId` plus the `projectRoot` to index, and may
+override any per-repo field (`memoryDir`, `codePatterns`, `docPatterns`,
+`skipPatterns`, `graph`, `wiki`); anything omitted inherits the server-level
+value.
 
 ```json
 {
-  "embedding": { "type": "ollama", "apiKey": null, "baseUrl": "http://host.docker.internal:11434", "model": "nomic-embed-text" },
+  "embedding": { "type": "ollama", "apiKey": null, "baseUrl": "http://localhost:11434", "model": "nomic-embed-text" },
   "repos": [
-    { "repoId": "pegasus", "projectRoot": "/repos/pegasus" },
-    { "repoId": "iceberg", "projectRoot": "/repos/iceberg" }
+    { "repoId": "pegasus", "projectRoot": "/Users/me/repos/pegasus" },
+    { "repoId": "iceberg", "projectRoot": "/Users/me/repos/iceberg" }
   ]
 }
 ```
 
-A ready-to-edit copy lives at `config.multi-repo.example.json`. Clients then
-select a repo per request via the [`X-Repo-Id`](#selecting-a-repo-x-repo-id)
-header, and `GET /health` reports each repo's index state:
+A ready-to-edit copy lives at `config.multi-repo.example.json`. With more than
+one entry, set `REPO_ID` to choose which repo this process serves (the first
+entry otherwise). To work several repos at once, launch one server per project —
+typically via each project's own `.mcp.json`. Each repo's rows stay isolated by
+`repo_id`, and each writes to its own `<projectRoot>/.repo-context/index.db`.
 
-```json
-{ "status": "ok", "index": "ready", "repos": { "pegasus": "ready", "iceberg": "building" } }
-```
-
-In Docker, mount each repo where its `projectRoot` points and supply the config
-without rebuilding the image (it is bind-mounted to `/app/config.json`):
-
-```sh
-REPO_CONFIG=./config.multi-repo.example.json REPOS_DIR=/abs/parent/of/repos \
-  docker compose up --build   # after uncommenting the /repos mount in docker-compose.yml
-```
-
-> **One embedding model per server.** All repos share a single `chunks` table
-> and therefore a single `vector(N)` width, so every repo must use the same
-> server-level `embedding` model. Per-repo models would need separate tables and
-> are not supported.
+> **One embedding model per store.** The embedding dimension is baked into the
+> sqlite-vec table, so a given `index.db` is tied to one `embedding` model. The
+> store auto-rebuilds if the configured model's dimension changes.
 
 ## Embedding providers
 
@@ -253,7 +203,7 @@ REPO_CONFIG=./config.multi-repo.example.json REPOS_DIR=/abs/parent/of/repos \
 | Mistral | mistral-embed | 1024 | `mistral` |
 | LM Studio | (custom) | 768 | `lmstudio` |
 
-The production target is **`nomic-embed-code` served via TEI** (GPU); the Compose default uses host Ollama with `nomic-embed-text` so it works without a GPU. Nomic models use **asymmetric task prefixes** — queries and documents are embedded with different instructions — which the adapter applies automatically.
+The richest option is **`nomic-embed-code` served via TEI** (GPU); the default config uses host Ollama with `nomic-embed-text` so it works without a GPU. Nomic models use **asymmetric task prefixes** — queries and documents are embedded with different instructions — which the adapter applies automatically.
 
 ## Usage with Claude Code
 
@@ -284,19 +234,15 @@ Always use the repo-context MCP tools **first** when exploring the codebase — 
 - **Deduplication** — Content hashing (SHA-256) avoids re-embedding unchanged files; only files whose hash changed are re-embedded.
 - **Pruning** — On every re-index (and on watcher `unlink`), rows for files no longer present on disk are removed, so deletions made while the server was down are cleaned up.
 - **File watching** — Chokidar watches for changes with a debounce and re-indexes automatically.
-- **Vector storage** — All chunks live in a single Postgres `chunks` table with a `vector(N)` column (pgvector), an **HNSW cosine index** for similarity search, and a `(repo_id, source, file_path)` lookup index. Rows are keyed by `(repo_id, source, id)`; writes are transactional delete-then-insert upserts.
-
-### Multi-repo isolation
-
-Every row carries a `repo_id`. One database **and one server** can serve many repositories simultaneously: each is declared in the `repos` config, indexed and watched independently, and a request selects which one via the `X-Repo-Id` header. Searches, indexing, and pruning are always scoped to that repo's `repo_id`, so repos never see each other's rows.
+- **Vector storage** — Chunk metadata lives in a relational `chunks` table; embeddings live in a [sqlite-vec](https://github.com/asg017/sqlite-vec) `vec0` virtual table (`distance_metric=cosine`) keyed by the same `rowid`, with `repo_id` and `source` as filterable columns. Search is a KNN `match` pre-filtered by repo + source, joined back to `chunks`. Writes are transactional delete-then-insert upserts. Everything sits in one file: `<projectRoot>/.repo-context/index.db`.
 
 ### Transport
 
-The server is a long-lived process exposing **Streamable HTTP** at `POST /mcp`. Each MCP session gets its own transport and `McpServer` instance, bound at initialization to the repo resolved from the `X-Repo-Id` header (or `/mcp/<repoId>` path fallback), and thereafter routed by the `mcp-session-id` header. `GET /health` reports liveness and per-repo index state (`starting` → `building` → `ready`). The server begins accepting connections before the initial index completes.
+The server speaks the **stdio** MCP transport: it reads JSON-RPC from stdin and writes responses to stdout (all logging goes to stderr to keep the protocol stream clean). One process serves a single repo. It answers the `initialize` handshake immediately and builds the index in the background, so searches return empty / graph queries report "not built yet" until the first build completes.
 
 ### Dependency graph
 
-Built by static analysis and git history, stored as `.repo-context/graph.json`. No embeddings required — queries are direct lookups.
+Built by static analysis and git history, stored as a JSON document in the `graph_doc` table of the same `index.db`. No embeddings required — queries load the document and do direct lookups in memory.
 
 - **Import edges** — TypeScript AST parses every file to extract `import` statements; relative imports resolve to actual file paths. Named imports are tracked per edge.
 - **Type & symbol consumers** — Reverse index from a type name (and from a qualified `defFile::name`) to every file that imports it. Use this before modifying a type to find all downstream consumers.
@@ -350,42 +296,38 @@ Content with [[wiki-links]] to connect related pages.
 
 ```
 src/
-  index.ts        Entry point, MCP tool registration, HTTP server, startup
+  index.ts        Entry point, MCP tool registration, stdio transport, startup
   types.ts        Shared TypeScript interfaces
-  db.ts           Postgres + pgvector connection, indexing, vector search
+  db.ts           bun:sqlite + sqlite-vec store: indexing, vector search, graph
   embeddings.ts   Embedding provider adapter (Ollama, TEI, OpenAI, ...)
   chunker.ts      AST-aware code chunking, markdown splitting
   graph.ts        Dependency graph extraction and co-change mining
   partition.ts    File-level conflict gate and parallel-wave scheduler
   wiki.ts         Wiki CRUD operations and page management
   watcher.ts      File watcher with debounced re-indexing
-
-Dockerfile          Bun runtime image for the server
-docker-compose.yml  Server + pgvector database
-config.docker.json  Container config (host Ollama embeddings)
 ```
 
 ### Data flow
 
 ```
 Startup
-  1. Load config (config file) + read env (DATABASE_URL, REPO_ID, PROJECT_ROOT, PORT)
-  2. initDb: connect Postgres, CREATE EXTENSION vector, create `chunks` table + indexes
+  1. Load config (config file) + read env (REPO_ID, PROJECT_ROOT, REPO_CONTEXT_SQLITE)
+  2. initDb: open .repo-context/index.db, load sqlite-vec, create chunks + vec0 + graph tables
   3. Initialize wiki directory
-  4. Start HTTP server (Streamable HTTP, POST /mcp) — serving begins immediately
-  5. Build index in background (state: building -> ready):
-     a. Code files   -> AST chunking     -> embed -> chunks (source='code')
-     b. Doc files    -> heading split     -> embed -> chunks (source='docs')
-     c. Memory files -> frontmatter parse -> embed -> chunks (source='memory')
-     d. Wiki files   -> heading split     -> embed -> chunks (source='wiki')
-     e. Code files   -> AST import parse  -> graph.json
-     f. Git log      -> co-change mining  -> graph.json
+  4. Connect stdio transport — initialize handshake answered immediately
+  5. Build index in background:
+     a. Code files   -> AST chunking     -> embed -> chunks + vec0 (source='code')
+     b. Doc files    -> heading split     -> embed -> chunks + vec0 (source='docs')
+     c. Memory files -> frontmatter parse -> embed -> chunks + vec0 (source='memory')
+     d. Wiki files   -> heading split     -> embed -> chunks + vec0 (source='wiki')
+     e. Code files   -> AST import parse  -> graph_doc
+     f. Git log      -> co-change mining  -> graph_doc
   6. Start file watchers (debounced re-index + prune on changes)
 
 Queries
-  - search_* tools -> embed query -> pgvector cosine search (scoped by repo_id) -> results
-  - query_* tools  -> load graph.json -> direct lookup -> results
-  - partition      -> load graph.json -> conflict graph + waves + advisory warnings
+  - search_* tools -> embed query -> sqlite-vec cosine KNN (scoped by repo_id+source) -> results
+  - query_* tools  -> load graph_doc -> direct lookup -> results
+  - partition      -> load graph_doc -> conflict graph + waves + advisory warnings
   - wiki CRUD      -> read/write files -> re-index wiki rows
 ```
 
@@ -398,13 +340,7 @@ bun test
 ```
 
 - **`src/partition.test.ts`** — pure unit tests for the conflict gate, wave scheduling, determinism, and advisory co-change overlay. Requires no external services.
-- **`src/db.test.ts`** — integration tests for the Postgres schema and the dedup / upsert / prune / search lifecycle. They run a self-contained fake embedder (no Ollama needed) and are **skipped unless `DATABASE_URL` is set**:
-
-  ```sh
-  DATABASE_URL="postgres://postgres:postgres@localhost:5432/repo_context" bun test
-  ```
-
-  The suite isolates itself under a dedicated `repo_id` and cleans up after each run.
+- **`src/db.test.ts`** — integration tests for the sqlite-vec store and the dedup / upsert / prune / search lifecycle. They run a self-contained fake embedder (no Ollama needed) against a throwaway `index.db` in a temp dir, so they need no external services — just an extension-capable sqlite (Homebrew on macOS). The suite isolates itself under a dedicated `repo_id` and cleans up after each run.
 
 ### Type checking
 

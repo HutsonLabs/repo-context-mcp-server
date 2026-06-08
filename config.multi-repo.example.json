@@ -2,7 +2,7 @@
   "embedding": {
     "type": "ollama",
     "apiKey": null,
-    "baseUrl": "http://host.docker.internal:11434",
+    "baseUrl": "http://localhost:11434",
     "model": "nomic-embed-text"
   },
   "codePatterns": ["**/*.{ts,tsx,js,jsx}"],
@@ -16,7 +16,7 @@
   "wiki": { "autoInit": true },
 
   "repos": [
-    { "repoId": "pegasus", "projectRoot": "/repos/pegasus" },
-    { "repoId": "iceberg", "projectRoot": "/repos/iceberg" }
+    { "repoId": "pegasus", "projectRoot": "/Users/me/repos/pegasus" },
+    { "repoId": "iceberg", "projectRoot": "/Users/me/repos/iceberg" }
   ]
 }

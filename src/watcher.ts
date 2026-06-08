@@ -79,7 +79,7 @@ export function startWatcher(config: WatcherConfig): () => void {
       // Rebuild graph when code changes
       await buildGraph(
         config.projectRoot,
-        config.indexDir,
+        config.repoId,
         config.codePatterns,
         config.skipPatterns,
         config.graphConfig.coChangeMinCount,

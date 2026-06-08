@@ -47,6 +47,12 @@ export interface RepoConfig {
 export interface ServerConfig {
   embedding: EmbeddingProviderConfig;
   /**
+   * Logical repo id for the single-repo (synthesized) case. Takes precedence
+   * over the `REPO_ID` env var, so the served repo's identity comes from
+   * `repo-context.json` rather than the environment. Ignored when `repos` is set.
+   */
+  name?: string;
+  /**
    * Repositories served by this instance. A request picks one via the
    * `X-Repo-Id` header. When omitted, the server synthesizes a single repo
    * from the `PROJECT_ROOT` / `REPO_ID` env vars (single-repo back-compat),
