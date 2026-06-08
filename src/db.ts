@@ -27,6 +27,10 @@ import type {
   MemorySearchResult,
   WikiSearchResult,
   DependencyGraph,
+  SymbolNode,
+  SymbolEdge,
+  SymbolEdgeKind,
+  SymbolQueryResult,
 } from './types.js';
 import { embedBatch, embedSingle } from './embeddings.js';
 import { chunkCode, chunkMarkdown, chunkMemory, chunkWiki, contentHash } from './chunker.js';
@@ -133,6 +137,9 @@ export async function initDb(opts: {
     handle.run('DROP TABLE IF EXISTS vec_chunks');
     handle.run('DROP TABLE IF EXISTS chunks');
     handle.run('DROP TABLE IF EXISTS graph_doc');
+    handle.run('DROP TABLE IF EXISTS symbol_nodes');
+    handle.run('DROP TABLE IF EXISTS symbol_edges');
+    handle.run('DROP TABLE IF EXISTS semantic_edges');
   }
 
   handle.run(`
@@ -171,6 +178,48 @@ export async function initDb(opts: {
       doc     TEXT NOT NULL
     )
   `);
+
+  // Symbol-level structural graph (class/function nodes + resolved edges) and
+  // the advisory embedding-similarity overlay. Relational so they stay queryable
+  // without loading a whole JSON document into memory.
+  handle.run(`
+    CREATE TABLE IF NOT EXISTS symbol_nodes (
+      repo_id TEXT NOT NULL,
+      id      TEXT NOT NULL,
+      name    TEXT NOT NULL,
+      kind    TEXT NOT NULL,
+      file    TEXT NOT NULL,
+      line    INTEGER NOT NULL,
+      lang    TEXT NOT NULL,
+      UNIQUE (repo_id, id)
+    )
+  `);
+  handle.run(
+    `CREATE INDEX IF NOT EXISTS symbol_nodes_name ON symbol_nodes (repo_id, name)`,
+  );
+
+  handle.run(`
+    CREATE TABLE IF NOT EXISTS symbol_edges (
+      repo_id TEXT NOT NULL,
+      src     TEXT NOT NULL,
+      dst     TEXT NOT NULL,
+      kind    TEXT NOT NULL,
+      UNIQUE (repo_id, src, dst, kind)
+    )
+  `);
+  handle.run(`CREATE INDEX IF NOT EXISTS symbol_edges_src ON symbol_edges (repo_id, src)`);
+  handle.run(`CREATE INDEX IF NOT EXISTS symbol_edges_dst ON symbol_edges (repo_id, dst)`);
+
+  handle.run(`
+    CREATE TABLE IF NOT EXISTS semantic_edges (
+      repo_id TEXT NOT NULL,
+      src     TEXT NOT NULL,
+      dst     TEXT NOT NULL,
+      score   REAL NOT NULL,
+      UNIQUE (repo_id, src, dst)
+    )
+  `);
+  handle.run(`CREATE INDEX IF NOT EXISTS semantic_edges_src ON semantic_edges (repo_id, src)`);
 
   writeMeta('dim', String(opts.dim));
 }
@@ -639,6 +688,244 @@ export function loadGraphDoc(repoId: string): DependencyGraph | null {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Symbol-level graph persistence + queries
+// ---------------------------------------------------------------------------
+
+/** Replace the entire symbol graph (nodes + structural edges) for a repo. */
+export function saveSymbolGraph(repoId: string, nodes: SymbolNode[], edges: SymbolEdge[]): void {
+  const handle = getDb();
+  const insNode = handle.query(
+    `INSERT OR IGNORE INTO symbol_nodes (repo_id, id, name, kind, file, line, lang)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const insEdge = handle.query(
+    `INSERT OR IGNORE INTO symbol_edges (repo_id, src, dst, kind) VALUES (?, ?, ?, ?)`,
+  );
+  const txn = handle.transaction(() => {
+    handle.run(`DELETE FROM symbol_nodes WHERE repo_id = ?`, [repoId]);
+    handle.run(`DELETE FROM symbol_edges WHERE repo_id = ?`, [repoId]);
+    for (const n of nodes) {
+      insNode.run(repoId, n.id, n.name, n.kind, n.file, n.line, n.lang);
+    }
+    for (const e of edges) {
+      insEdge.run(repoId, e.src, e.dst, e.kind);
+    }
+  });
+  txn();
+}
+
+/** Count helper for startup/log lines. */
+export function symbolGraphCounts(repoId: string): { nodes: number; edges: number; semantic: number } {
+  const handle = getDb();
+  const n = handle.query(`SELECT COUNT(*) AS c FROM symbol_nodes WHERE repo_id = ?`).get(repoId) as { c: number };
+  const e = handle.query(`SELECT COUNT(*) AS c FROM symbol_edges WHERE repo_id = ?`).get(repoId) as { c: number };
+  const s = handle.query(`SELECT COUNT(*) AS c FROM semantic_edges WHERE repo_id = ?`).get(repoId) as { c: number };
+  return { nodes: n.c, edges: e.c, semantic: s.c };
+}
+
+/**
+ * Advisory embedding-similarity overlay between symbols (NON-gating, mirrors the
+ * co-change overlay). For each indexed code chunk, find its nearest other-file
+ * code chunks, map both endpoints to symbol nodes (via the chunk's exports), and
+ * record undirected edges above `minScore`. Skips chunks that don't map to a
+ * known symbol. Requires the code index and symbol graph to already exist.
+ */
+export function buildSemanticOverlay(
+  repoId: string,
+  opts?: { minScore?: number; topK?: number },
+): number {
+  const minScore = opts?.minScore ?? 0.78;
+  const topK = opts?.topK ?? 5;
+  const handle = getDb();
+
+  // Map a code chunk (file + exported names) to a symbol node id, if any.
+  const nodeIds = new Set(
+    (handle.query(`SELECT id FROM symbol_nodes WHERE repo_id = ?`).all(repoId) as Array<{ id: string }>).map(
+      (r) => r.id,
+    ),
+  );
+  if (nodeIds.size === 0) {
+    handle.run(`DELETE FROM semantic_edges WHERE repo_id = ?`, [repoId]);
+    return 0;
+  }
+  const toNodeId = (file: string, exportsCsv: string | null): string | null => {
+    if (!exportsCsv) return null;
+    for (const raw of exportsCsv.split(',')) {
+      const name = raw.trim();
+      if (!name) continue;
+      const id = `${file}::${name}`;
+      if (nodeIds.has(id)) return id;
+    }
+    return null;
+  };
+
+  const chunkRows = handle
+    .query(`SELECT rowid, file_path, exports FROM chunks WHERE repo_id = ? AND source = 'code'`)
+    .all(repoId) as Array<{ rowid: number; file_path: string; exports: string | null }>;
+
+  const getVec = handle.query(`SELECT embedding FROM vec_chunks WHERE rowid = ?`);
+  const knnQ = handle.query(
+    `SELECT c.file_path AS file_path, c.exports AS exports, v.distance AS distance
+       FROM vec_chunks v
+       JOIN chunks c ON c.rowid = v.rowid
+      WHERE v.repo_id = ? AND v.source = 'code' AND v.embedding MATCH ? AND k = ?
+      ORDER BY v.distance`,
+  );
+
+  const edges: Array<{ src: string; dst: string; score: number }> = [];
+  const seen = new Set<string>();
+
+  for (const ch of chunkRows) {
+    const srcId = toNodeId(ch.file_path, ch.exports);
+    if (!srcId) continue;
+    const vrow = getVec.get(ch.rowid) as { embedding: Uint8Array } | undefined;
+    if (!vrow) continue;
+
+    // Pull a few extra neighbors so same-file hits can be filtered out.
+    const neighbors = knnQ.all(repoId, vrow.embedding, topK + 5) as Array<{
+      file_path: string;
+      exports: string | null;
+      distance: number;
+    }>;
+
+    let kept = 0;
+    for (const n of neighbors) {
+      if (kept >= topK) break;
+      if (n.file_path === ch.file_path) continue; // excludes self + same-file siblings
+      const score = scoreFromDistance(n.distance);
+      if (score < minScore) continue;
+      const dstId = toNodeId(n.file_path, n.exports);
+      if (!dstId || dstId === srcId) continue;
+
+      const [a, b] = srcId < dstId ? [srcId, dstId] : [dstId, srcId];
+      const key = `${a} ${b}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({ src: a, dst: b, score });
+      kept++;
+    }
+  }
+
+  // Deterministic: by src, then descending score, then dst.
+  edges.sort(
+    (x, y) =>
+      (x.src < y.src ? -1 : x.src > y.src ? 1 : 0) ||
+      y.score - x.score ||
+      (x.dst < y.dst ? -1 : x.dst > y.dst ? 1 : 0),
+  );
+
+  const insEdge = handle.query(
+    `INSERT OR IGNORE INTO semantic_edges (repo_id, src, dst, score) VALUES (?, ?, ?, ?)`,
+  );
+  const txn = handle.transaction(() => {
+    handle.run(`DELETE FROM semantic_edges WHERE repo_id = ?`, [repoId]);
+    for (const e of edges) insEdge.run(repoId, e.src, e.dst, e.score);
+  });
+  txn();
+
+  return edges.length;
+}
+
+/**
+ * Resolve a symbol (by exact "file::name" id, or by bare name) and return its
+ * definition, structural edges in both directions, and advisory semantic
+ * neighbors. The two edge kinds are kept separate by the caller's formatting.
+ */
+export function querySymbol(repoId: string, query: string): SymbolQueryResult {
+  const handle = getDb();
+  const q = query.trim();
+
+  const matches = (
+    q.includes('::')
+      ? handle.query(`SELECT * FROM symbol_nodes WHERE repo_id = ? AND id = ?`).all(repoId, q)
+      : handle
+          .query(`SELECT * FROM symbol_nodes WHERE repo_id = ? AND name = ? ORDER BY id`)
+          .all(repoId, q)
+  ) as SymbolNode[];
+
+  if (matches.length === 0) {
+    return { matches: [], outgoing: [], incoming: [], semanticNeighbors: [] };
+  }
+
+  const ids = matches.map((m) => m.id);
+  const placeholders = ids.map(() => '?').join(', ');
+
+  const outRows = handle
+    .query(
+      `SELECT e.kind AS kind, n.id AS id, n.name AS name, n.kind AS nkind, n.file AS file, n.line AS line, n.lang AS lang
+         FROM symbol_edges e JOIN symbol_nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
+        WHERE e.repo_id = ? AND e.src IN (${placeholders})
+        ORDER BY e.kind, n.id`,
+    )
+    .all(repoId, ...ids) as Array<{
+    kind: SymbolEdgeKind;
+    id: string;
+    name: string;
+    nkind: SymbolNode['kind'];
+    file: string;
+    line: number;
+    lang: string;
+  }>;
+
+  const inRows = handle
+    .query(
+      `SELECT e.kind AS kind, n.id AS id, n.name AS name, n.kind AS nkind, n.file AS file, n.line AS line, n.lang AS lang
+         FROM symbol_edges e JOIN symbol_nodes n ON n.repo_id = e.repo_id AND n.id = e.src
+        WHERE e.repo_id = ? AND e.dst IN (${placeholders})
+        ORDER BY e.kind, n.id`,
+    )
+    .all(repoId, ...ids) as Array<{
+    kind: SymbolEdgeKind;
+    id: string;
+    name: string;
+    nkind: SymbolNode['kind'];
+    file: string;
+    line: number;
+    lang: string;
+  }>;
+
+  const semRows = handle
+    .query(
+      `SELECT n.id AS id, n.name AS name, n.kind AS nkind, n.file AS file, n.line AS line, n.lang AS lang, s.score AS score
+         FROM semantic_edges s
+         JOIN symbol_nodes n
+           ON n.repo_id = s.repo_id
+          AND n.id = CASE WHEN s.src IN (${placeholders}) THEN s.dst ELSE s.src END
+        WHERE s.repo_id = ?
+          AND (s.src IN (${placeholders}) OR s.dst IN (${placeholders}))
+        ORDER BY s.score DESC, n.id`,
+    )
+    .all(...ids, repoId, ...ids, ...ids) as Array<{
+    id: string;
+    name: string;
+    nkind: SymbolNode['kind'];
+    file: string;
+    line: number;
+    lang: string;
+    score: number;
+  }>;
+
+  const toNode = (r: { id: string; name: string; nkind: SymbolNode['kind']; file: string; line: number; lang: string }): SymbolNode => ({
+    id: r.id,
+    name: r.name,
+    kind: r.nkind,
+    file: r.file,
+    line: r.line,
+    lang: r.lang,
+  });
+
+  const matchIds = new Set(ids);
+  return {
+    matches,
+    outgoing: outRows.filter((r) => !matchIds.has(r.id)).map((r) => ({ kind: r.kind, node: toNode(r) })),
+    incoming: inRows.filter((r) => !matchIds.has(r.id)).map((r) => ({ kind: r.kind, node: toNode(r) })),
+    semanticNeighbors: semRows
+      .filter((r) => !matchIds.has(r.id))
+      .map((r) => ({ node: toNode(r), score: r.score })),
+  };
 }
 
 // ---------------------------------------------------------------------------

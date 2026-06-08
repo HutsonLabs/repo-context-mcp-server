@@ -14,7 +14,9 @@
   ],
   "graph": {
     "coChangeMinCount": 3,
-    "coChangeMaxCommits": 500
+    "coChangeMaxCommits": 500,
+    "symbols": { "enabled": true },
+    "semantic": { "minScore": 0.78, "topK": 5 }
   },
   "wiki": {
     "autoInit": true

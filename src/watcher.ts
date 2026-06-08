@@ -2,8 +2,16 @@
 
 import { watch } from 'chokidar';
 import type { EmbeddingProviderConfig } from './types.js';
-import { indexCode, indexDocs, indexMemory, indexWiki, deleteFileFromTable } from './db.js';
+import {
+  indexCode,
+  indexDocs,
+  indexMemory,
+  indexWiki,
+  deleteFileFromTable,
+  buildSemanticOverlay,
+} from './db.js';
 import { buildGraph } from './graph.js';
+import { buildSymbolGraph } from './symbols.js';
 
 const DEBOUNCE_MS = 5000;
 
@@ -20,6 +28,9 @@ interface WatcherConfig {
   graphConfig: {
     coChangeMinCount: number;
     coChangeMaxCommits: number;
+    symbolsEnabled: boolean;
+    semanticMinScore?: number;
+    semanticTopK?: number;
   };
 }
 
@@ -85,6 +96,19 @@ export function startWatcher(config: WatcherConfig): () => void {
         config.graphConfig.coChangeMinCount,
         config.graphConfig.coChangeMaxCommits,
       );
+      // Rebuild the symbol graph + advisory semantic overlay (overlay reads the
+      // code vectors just refreshed above).
+      await buildSymbolGraph(
+        config.projectRoot,
+        config.repoId,
+        config.codePatterns,
+        config.skipPatterns,
+        { enabled: config.graphConfig.symbolsEnabled },
+      );
+      buildSemanticOverlay(config.repoId, {
+        minScore: config.graphConfig.semanticMinScore,
+        topK: config.graphConfig.semanticTopK,
+      });
     });
   });
 

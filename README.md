@@ -3,7 +3,7 @@
 MCP server that gives AI coding assistants deep codebase context through four complementary systems:
 
 1. **Vector search** — Semantic similarity search over code, docs, and memory
-2. **Dependency graph** — Import edges, type/symbol consumers, and git co-change analysis
+2. **Dependency graph** — File import edges, **symbol-level structural edges** (class/function `calls` / `extends` / `implements` / `uses-type`, resolved by the TypeScript type checker), an **advisory embedding-similarity overlay** between symbols, type/symbol consumers, and git co-change analysis
 3. **LLM Wiki** — AI-maintained knowledge base for decisions and tribal knowledge
 4. **Partition scheduler** — Computes which issues can be worked in parallel without file conflicts
 
@@ -26,6 +26,7 @@ Vectors are stored in a single local **sqlite** file via the **[sqlite-vec](http
 - **query_dependencies** — Find what a file imports and what imports it, with configurable traversal depth.
 - **query_co_changes** — Find files that frequently change together in git history.
 - **query_type_consumers** — Find where a type/interface is defined and which files consume it. Supports qualified `defFile::name` lookups for disambiguation.
+- **query_symbol** — Look up a class/function/type at **declaration granularity** (by `file::name` id or bare name). Returns its definition, **exact** structural edges in both directions (what it `calls`/`extends`/`implements`/uses, and what calls/uses it — resolved by the type checker), and **advisory** semantic neighbors (embedding similarity, never authoritative).
 
 ### Wiki (knowledge base)
 
@@ -142,7 +143,9 @@ All fields except `embedding` are optional:
   ],
   "graph": {
     "coChangeMinCount": 3,
-    "coChangeMaxCommits": 500
+    "coChangeMaxCommits": 500,
+    "symbols": { "enabled": true },
+    "semantic": { "minScore": 0.78, "topK": 5 }
   },
   "wiki": {
     "autoInit": true
@@ -161,6 +164,9 @@ All fields except `embedding` are optional:
 | `repos` | (unset) | Array of repositories to serve. When present, the server runs multi-repo and ignores `projectRoot`/`REPO_ID`. See [Multiple repositories](#multiple-repositories). |
 | `graph.coChangeMinCount` | `3` | Minimum co-occurrence count to record a co-change pair |
 | `graph.coChangeMaxCommits` | `500` | How many commits to scan for co-change analysis |
+| `graph.symbols.enabled` | `true` | Build the symbol-level structural graph (class/function nodes + resolved edges) |
+| `graph.semantic.minScore` | `0.78` | Minimum cosine similarity to record an advisory semantic-overlay edge |
+| `graph.semantic.topK` | `5` | Max semantic neighbors kept per symbol |
 | `wiki.autoInit` | `true` | Create wiki directory and index/log files on first run |
 
 > The embedding **dimension is derived from the model** (e.g. `nomic-embed-text` → 768, `nomic-embed-code` → 3584) and fixes the `vector(N)` column width at first run. Changing models against an existing database requires a fresh `repo_id` or a reset of the `chunks` table.
@@ -222,6 +228,7 @@ Always use the repo-context MCP tools **first** when exploring the codebase — 
 - `query_dependencies` — find what imports a file and what it imports
 - `query_co_changes` — find files that change together
 - `query_type_consumers` — find all consumers of a type before changing it
+- `query_symbol` — find a symbol's callers/callees and what it extends/uses, before changing it
 - `search_wiki` / `read_wiki_page` — find architectural decisions and tribal knowledge
 ```
 
@@ -244,13 +251,22 @@ The server speaks the **stdio** MCP transport: it reads JSON-RPC from stdin and 
 
 ### Dependency graph
 
-Built by static analysis and git history, stored as a JSON document in the `graph_doc` table of the same `index.db`. No embeddings required — queries load the document and do direct lookups in memory.
+The graph has two granularities, kept in the same `index.db`:
+
+**File-level** (stored as a JSON document in `graph_doc`; no embeddings needed — queries load the document and do direct lookups in memory):
 
 - **Import edges** — TypeScript AST parses every file to extract `import` statements; relative imports resolve to actual file paths. Named imports are tracked per edge.
 - **Type & symbol consumers** — Reverse index from a type name (and from a qualified `defFile::name`) to every file that imports it. Use this before modifying a type to find all downstream consumers.
 - **Co-change pairs** — Mines `git log` for files that change together, filtering merge commits and large refactors.
 - **HEAD SHA** — The graph records the git HEAD it was built against, so partitions can be stamped/validated.
-- **Auto-rebuild** — The graph rebuilds automatically when code files change (via the file watcher).
+
+**Symbol-level** (stored in relational tables: `symbol_nodes`, `symbol_edges`, `semantic_edges`), powering `query_symbol`:
+
+- **Structural edges (exact).** A real `ts.Program` + TypeChecker resolves references between declarations — `calls`, `extends`, `implements`, `uses-type` — across files, through imports and aliases. Nodes are classes / functions / methods / interfaces / types / enums, keyed `file::name` (methods `file::Class.method`). This is ground truth, not a heuristic.
+- **Semantic overlay (advisory).** For each indexed code chunk, the nearest *other-file* chunks (above a similarity threshold) are recorded as embedding-similarity edges between the symbols they cover. Like co-change, this is **advisory** — surfaced under a clearly separated heading, never gating anything.
+- **Language extractors.** Structural extraction runs behind a `SymbolExtractor` registry; only TypeScript/JavaScript is implemented today. Other languages (Python/Java/Go, likely SCIP-backed) slot in as new extractors without changing callers.
+
+**Auto-rebuild** — Both layers rebuild automatically when code files change (via the file watcher).
 
 ### Partition scheduler
 
@@ -303,7 +319,8 @@ src/
   db.ts           bun:sqlite + sqlite-vec store: indexing, vector search, graph
   embeddings.ts   Embedding provider adapter (Ollama, TEI, OpenAI, ...)
   chunker.ts      AST-aware code chunking, markdown splitting
-  graph.ts        Dependency graph extraction and co-change mining
+  graph.ts        File-level dependency graph extraction and co-change mining
+  symbols.ts      Symbol-level structural graph (ts.Program + TypeChecker) + extractor registry
   partition.ts    File-level conflict gate and parallel-wave scheduler
   wiki.ts         Wiki CRUD operations and page management
   watcher.ts      File watcher with debounced re-indexing
@@ -324,13 +341,16 @@ Startup
      d. Wiki files   -> heading split     -> embed -> chunks + vec0 (source='wiki')
      e. Code files   -> AST import parse  -> graph_doc
      f. Git log      -> co-change mining  -> graph_doc
+     g. Code files   -> ts.Program + checker -> symbol_nodes + symbol_edges
+     h. Code vectors -> KNN per chunk     -> semantic_edges (advisory overlay)
   6. Start file watchers (debounced re-index + prune on changes)
 
 Queries
-  - search_* tools -> embed query -> sqlite-vec cosine KNN (scoped by repo_id+source) -> results
-  - query_* tools  -> load graph_doc -> direct lookup -> results
-  - partition      -> load graph_doc -> conflict graph + waves + advisory warnings
-  - wiki CRUD      -> read/write files -> re-index wiki rows
+  - search_* tools     -> embed query -> sqlite-vec cosine KNN (scoped by repo_id+source) -> results
+  - query_deps/co/type -> load graph_doc -> direct lookup -> results
+  - query_symbol       -> symbol_nodes/edges + semantic_edges -> definition + structural + advisory
+  - partition          -> load graph_doc -> conflict graph + waves + advisory warnings
+  - wiki CRUD          -> read/write files -> re-index wiki rows
 ```
 
 ## Development

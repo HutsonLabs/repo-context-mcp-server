@@ -151,6 +151,7 @@ then query the graph to map exactly what connects to it.
 |---|---|
 | `query_dependencies` | You found a file and need its blast radius: what it imports, and (the part agents usually miss) **what imports it.** Set `depth > 1` to walk transitively. |
 | `query_type_consumers` | **Before changing a type or interface.** Returns every file that imports it, including qualified `defFile::name` matches so same-named symbols from different files don't get conflated. This is the difference between a complete refactor and a broken build. |
+| `query_symbol` | **Before changing a function/class/method.** Returns its definition plus *exact* type-checker-resolved edges: what it calls / extends / implements / uses, and — crucially — what calls or uses *it*, at declaration granularity (not just "files that import this file"). Also lists advisory semantic neighbors (similar symbols elsewhere) under a separate, clearly-labeled heading. |
 | `query_co_changes` | You want files that *historically move together* in git, even with no import edge between them — config + the code it gates, a test + its fixture, a schema + its migration. Hidden coupling that static analysis can't see. |
 
 ### Planning parallel work — `partition`
@@ -182,9 +183,12 @@ type that other code depends on:
 2. **`query_type_consumers "RepoConfig"`** — structural verification returns the
    *complete* list of files importing it. No `grep` false positives from
    comments or unrelated same-named symbols.
-3. **`query_co_changes`** on the definition file — surfaces the migration script
+3. **`query_symbol "src/db.ts::initDb"`** — when the thing you're changing is a
+   function or method, get its exact callers and callees at declaration
+   granularity, so you know precisely which call sites move with the change.
+4. **`query_co_changes`** on the definition file — surfaces the migration script
    that always changes with it but has no import edge, so you don't forget it.
-4. Make the change across exactly that set, confident it's the whole set.
+5. Make the change across exactly that set, confident it's the whole set.
 
 Step 1 alone is a hunch. Steps 2–3 turn it into a verified boundary. That
 recall-then-verify loop is why the structural graph and the semantic index are

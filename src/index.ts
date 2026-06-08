@@ -38,6 +38,9 @@ import {
   searchDocs,
   searchMemory,
   searchWiki,
+  buildSemanticOverlay,
+  querySymbol,
+  symbolGraphCounts,
 } from './db.js';
 import { partition, formatPartition, type TouchSet } from './partition.js';
 import { startWatcher } from './watcher.js';
@@ -48,6 +51,7 @@ import {
   queryCoChanges,
   queryTypeConsumers,
 } from './graph.js';
+import { buildSymbolGraph } from './symbols.js';
 import {
   initWiki,
   readWikiPage,
@@ -55,7 +59,7 @@ import {
   listWikiPages,
   getWikiDir,
 } from './wiki.js';
-import type { RepoConfig, GraphConfig } from './types.js';
+import type { RepoConfig, GraphConfig, SymbolQueryResult, SymbolEdgeKind } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -200,10 +204,82 @@ async function buildIndex(repo: RepoCtx) {
     repo.graphConfig.coChangeMaxCommits ?? 500,
   );
 
+  // Symbol-level structural graph + advisory semantic overlay. The overlay reads
+  // the code vectors written above, so it must run after indexCode.
+  await buildSymbolGraph(repo.projectRoot, repo.repoId, repo.codePatterns, repo.skipPatterns, {
+    enabled: repo.graphConfig.symbols?.enabled,
+  });
+  buildSemanticOverlay(repo.repoId, {
+    minScore: repo.graphConfig.semantic?.minScore,
+    topK: repo.graphConfig.semantic?.topK,
+  });
+  const sym = symbolGraphCounts(repo.repoId);
+
   const edgeCount = Object.values(graph.imports).reduce((sum, arr) => sum + arr.length, 0);
   console.error(
-    `[startup] Index built for '${repo.repoId}': ${codeCount} code, ${docsCount} docs, ${memoryCount} memory, ${wikiCount} wiki chunks, ${edgeCount} import edges, ${graph.coChanges.length} co-change pairs`,
+    `[startup] Index built for '${repo.repoId}': ${codeCount} code, ${docsCount} docs, ${memoryCount} memory, ${wikiCount} wiki chunks, ${edgeCount} import edges, ${graph.coChanges.length} co-change pairs, ${sym.nodes} symbols, ${sym.edges} symbol edges, ${sym.semantic} semantic edges`,
   );
+}
+
+// Map structural edge kinds to human-readable labels for both directions.
+const OUT_LABEL: Record<SymbolEdgeKind, string> = {
+  calls: 'calls',
+  extends: 'extends',
+  implements: 'implements',
+  'uses-type': 'uses type',
+  references: 'references',
+};
+const IN_LABEL: Record<SymbolEdgeKind, string> = {
+  calls: 'called by',
+  extends: 'extended by',
+  implements: 'implemented by',
+  'uses-type': 'used as type by',
+  references: 'referenced by',
+};
+
+function formatSymbol(query: string, r: SymbolQueryResult): string {
+  const lines: string[] = [`## Symbol: \`${query}\`\n`];
+
+  lines.push('### Defined');
+  for (const m of r.matches) {
+    lines.push(`- \`${m.id}\` (${m.kind}) — ${m.file}:${m.line}`);
+  }
+
+  const group = (
+    edges: Array<{ kind: SymbolEdgeKind; node: { id: string } }>,
+    labels: Record<SymbolEdgeKind, string>,
+  ): string[] => {
+    const byKind = new Map<SymbolEdgeKind, string[]>();
+    for (const e of edges) {
+      if (!byKind.has(e.kind)) byKind.set(e.kind, []);
+      byKind.get(e.kind)!.push(`\`${e.node.id}\``);
+    }
+    const out: string[] = [];
+    for (const kind of Object.keys(labels) as SymbolEdgeKind[]) {
+      const ids = byKind.get(kind);
+      if (ids && ids.length) out.push(`- **${labels[kind]}**: ${[...new Set(ids)].join(', ')}`);
+    }
+    return out;
+  };
+
+  lines.push('\n### Structural — outgoing (exact)');
+  const out = group(r.outgoing, OUT_LABEL);
+  lines.push(out.length ? out.join('\n') : '*none*');
+
+  lines.push('\n### Structural — incoming (exact)');
+  const inc = group(r.incoming, IN_LABEL);
+  lines.push(inc.length ? inc.join('\n') : '*none*');
+
+  lines.push('\n### ~ Semantic neighbors (advisory — embedding similarity, non-gating)');
+  if (r.semanticNeighbors.length) {
+    for (const n of r.semanticNeighbors) {
+      lines.push(`- \`${n.node.id}\` (${n.score.toFixed(2)})`);
+    }
+  } else {
+    lines.push('*none above threshold*');
+  }
+
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +513,37 @@ server.tool(
   },
 );
 
+server.tool(
+  'query_symbol',
+  'Look up a class/function/type symbol at declaration granularity. Returns its definition, EXACT structural edges resolved by the type checker (what it calls / extends / implements / uses, and what calls / uses it), and ADVISORY semantic neighbors (embedding similarity — surfaced, never authoritative). Accepts a "file::name" id or a bare name.',
+  {
+    symbol: z
+      .string()
+      .describe('Symbol id like "src/db.ts::initDb" (or "file::Class.method"), or a bare name like "initDb"'),
+  },
+  async ({ symbol }) => {
+    try {
+      const result = querySymbol(repo.repoId, symbol);
+      if (result.matches.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Symbol "${symbol}" not found in the symbol graph (it may not be built yet, or the name needs a "file::name" qualifier).`,
+            },
+          ],
+        };
+      }
+      return { content: [{ type: 'text' as const, text: formatSymbol(symbol, result) }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
 // ---------------------------------------------------------------------------
 // Wiki tools
 // ---------------------------------------------------------------------------
@@ -617,6 +724,9 @@ async function buildAndWatch(): Promise<void> {
     graphConfig: {
       coChangeMinCount: repo.graphConfig.coChangeMinCount ?? 3,
       coChangeMaxCommits: repo.graphConfig.coChangeMaxCommits ?? 500,
+      symbolsEnabled: repo.graphConfig.symbols?.enabled !== false,
+      semanticMinScore: repo.graphConfig.semantic?.minScore,
+      semanticTopK: repo.graphConfig.semantic?.topK,
     },
   });
 }

@@ -39,7 +39,8 @@ bun run src/index.ts   # run the server against the cwd (the repo to index)
 | `src/db.ts` | sqlite + sqlite-vec store: indexing, dedup/upsert/prune, vector search, graph doc persistence |
 | `src/embeddings.ts` | Embedding provider adapter (Ollama, TEI, OpenAI, Google, Mistral, LM Studio) + dimension derivation |
 | `src/chunker.ts` | AST-aware code chunking, markdown/heading splitting, content hashing |
-| `src/graph.ts` | Dependency graph: AST import edges, type/symbol consumers, git co-change mining |
+| `src/graph.ts` | File-level dependency graph: AST import edges, type/symbol consumers, git co-change mining |
+| `src/symbols.ts` | Symbol-level structural graph (`ts.Program` + TypeChecker) behind a `SymbolExtractor` registry |
 | `src/partition.ts` | Pure file-level conflict gate + deterministic wave scheduler |
 | `src/wiki.ts` | Wiki CRUD and page management |
 | `src/watcher.ts` | Debounced file watcher → re-index + graph rebuild |
@@ -56,16 +57,27 @@ bun run src/index.ts   # run the server against the cwd (the repo to index)
 - **Co-change is advisory, never gating.** In `partition`, historical co-change
   surfaces as a warning only — it must never add a conflict edge or change the
   waves. Keep it that way.
+- **The semantic overlay is advisory, never gating.** `semantic_edges` (embedding
+  similarity between symbols) is surfaced under a separate heading in
+  `query_symbol` output and must never feed `partition` or be presented as
+  authoritative. Structural `symbol_edges` are the ground truth; the overlay is a
+  hint. Same contract as co-change.
+- **Structural edges are exact and TS/JS-only for now.** `symbols.ts` resolves
+  edges via the TypeChecker — do not replace it with name-matching heuristics. New
+  languages are added as `SymbolExtractor` implementations in the registry, not by
+  loosening the resolver.
 - **The file-level gate is the only conflict rule.** Two issues conflict iff
   their file sets intersect. Don't add hidden gating heuristics.
 - **One embedding model per store.** The vector column width is fixed at first
   build from the model's dimension. Changing models requires a fresh `repo_id` or
   a store rebuild (the store auto-rebuilds on dimension change).
 - **Config defaults live in `src/index.ts`** (`DEFAULT_CODE_PATTERNS`,
-  `DEFAULT_DOC_PATTERNS`, `DEFAULT_SKIP_PATTERNS`). If you change a default,
-  update the config table in `README.md` to match. Note `config.example.json`
-  intentionally shows a *customized* superset (adds `README.md`,
-  `.claude/worktrees`, `.repo-context`), not the bare defaults.
+  `DEFAULT_DOC_PATTERNS`, `DEFAULT_SKIP_PATTERNS`) and inline fallbacks
+  (`graph.symbols.enabled` → true, `graph.semantic.minScore` → 0.78,
+  `graph.semantic.topK` → 5). If you change a default, update the config table in
+  `README.md` to match. Note `config.example.json` intentionally shows a
+  *customized* superset (adds `README.md`, `.claude/worktrees`, `.repo-context`),
+  not the bare defaults.
 - **The graph stamps HEAD.** `buildGraph` records the git HEAD SHA so partitions
   can be validated against the tree they were computed for. Preserve that.
 

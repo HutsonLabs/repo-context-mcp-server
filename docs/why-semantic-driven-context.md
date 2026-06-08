@@ -74,10 +74,15 @@ layer.
 ### The structural layer — proof by construction
 
 The dependency graph is not embedded and not ranked. It is computed
-deterministically:
+deterministically, at two granularities:
 
-- **Import edges** from the TypeScript AST — who imports whom, with the named
-  symbols on each edge, relative paths resolved to real files.
+- **File-level import edges** from the TypeScript AST — who imports whom, with the
+  named symbols on each edge, relative paths resolved to real files.
+- **Symbol-level structural edges** at class/function granularity — a real
+  `ts.Program` + TypeChecker resolves `calls`, `extends`, `implements`, and
+  `uses-type` between *declarations*, across files and through import aliases. This
+  is a call/reference graph, not a name match: `query_symbol("file::initDb")`
+  returns the functions it actually calls and the ones that actually call it.
 - **Type and symbol consumers** — a reverse index from a type to every file that
   imports it, including qualified `defFile::name` keys so two same-named symbols
   from different files never get conflated.
@@ -86,10 +91,21 @@ deterministically:
 - **A HEAD SHA stamp** — the exact commit the graph was built against, so any
   answer can be validated against the tree it describes.
 
-These are not "probably." `query_type_consumers` returns *every* importer,
-because it was built by walking *every* import statement. There are no false
-positives from comments or string literals, and — within the analyzed
-file set — no false negatives. **The structural layer is ground truth.**
+These are not "probably." `query_type_consumers` returns *every* importer, and
+`query_symbol` returns *every* resolved caller, because both were built by walking
+*every* reference through the type checker. There are no false positives from
+comments or string literals, and — within the analyzed file set — no false
+negatives. **The structural layer is ground truth.**
+
+There is also a deliberately *fuzzy* member of this family: an **advisory
+semantic overlay**. For each symbol, the embedding index records its nearest
+neighbors in other files as similarity edges. This is the one place embeddings
+enter the graph — and it is labeled as advisory everywhere it surfaces, exactly
+because it is a ranked guess and not a resolved fact. It earns its place the same
+way co-change does: it catches *conceptual* siblings (two hand-rolled retry loops,
+a duplicated validator) that share no import and no call edge. Treated as a hint,
+it is valuable; treated as proof, it would be a lie — so the design never lets it
+masquerade as one.
 
 > **Why "semantic-driven" and not "structural-driven"?** Because the graph,
 > however exact, is inert without a way in. A graph of ten thousand nodes is
@@ -157,8 +173,10 @@ them?" goes from a judgment call to a closed list. A refactor against a complete
 consumer set either compiles or names exactly what's left.
 
 **Blast radius is known before the edit, not after.** `query_dependencies` (with
-transitive depth) and `query_co_changes` together answer "what does touching this
-break?" *before* the change. The agent reasons about consequences instead of
+transitive depth), `query_symbol` (exact callers of a function, not just importers
+of its file), and `query_co_changes` together answer "what does touching this
+break?" *before* the change — at the granularity of the actual declaration being
+edited, not the whole file. The agent reasons about consequences instead of
 discovering them in CI.
 
 **Less wasted context, more thinking.** Every file an agent reads to *find* the
@@ -190,11 +208,17 @@ every claim in real edges fights *imagined*.
 The argument above is strong, not unlimited. Where the design deliberately holds
 back:
 
-- **Structural analysis is currently TypeScript/JavaScript-aware.** The import
-  and type graph is as complete as the AST it's built from; files outside the
-  analyzed set are outside the guarantee. The semantic layer still indexes other
-  files as text, but they won't have verified edges. (Language-agnostic
-  structural edges — e.g. via SCIP — are tracked as future work.)
+- **Structural analysis is currently TypeScript/JavaScript-aware.** Both the
+  file-level import graph and the symbol-level call/reference graph are resolved by
+  the TypeScript type checker, so they are exact for TS/JS but blind to other
+  languages. Extraction runs behind a `SymbolExtractor` registry; files outside
+  the analyzed set are indexed by the semantic layer as text but have no verified
+  edges. (Polyglot extractors for Python/Java/Go — likely SCIP-backed — are the
+  planned extension; the registry is the seam where they plug in.)
+- **The semantic overlay is similarity, not a relationship.** Embedding-nearest
+  symbols are *conceptual* siblings, not a proven dependency — so, like co-change,
+  the overlay is exposed as advisory: surfaced under a separate heading in
+  `query_symbol`, never gating, never mixed into the resolved structural edges.
 - **Co-change is correlation, not causation.** Two files moving together in git
   doesn't *prove* a dependency. That's exactly why co-change is exposed as an
   **advisory overlay** — in `query_co_changes` as a signal to investigate, and in

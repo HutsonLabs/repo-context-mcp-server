@@ -18,7 +18,10 @@ import {
   indexCode,
   searchCode,
   deleteFileFromTable,
+  buildSemanticOverlay,
+  querySymbol,
 } from './db.js';
+import { buildSymbolGraph } from './symbols.js';
 
 const DIM = 768; // lmstudio default dim; matches fake embedder output
 
@@ -216,5 +219,51 @@ describe('db — bun:sqlite + sqlite-vec integration', () => {
     } finally {
       rmSync(rootB, { recursive: true, force: true });
     }
+  });
+
+  test('symbol graph: querySymbol returns resolved structural edges', async () => {
+    writeProjectFile('base2.ts', `export function shared() { return 1; }\n`);
+    writeProjectFile(
+      'user2.ts',
+      `import { shared } from './base2';\nexport function useShared() { return shared(); }\n`,
+    );
+
+    await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
+    const counts = await buildSymbolGraph(projectRoot, REPO_ID, ['**/*.ts'], ['node_modules']);
+    expect(counts.nodes).toBeGreaterThan(0);
+
+    // Outgoing call edge on the caller.
+    const caller = querySymbol(REPO_ID, 'user2.ts::useShared');
+    expect(caller.matches).toHaveLength(1);
+    expect(
+      caller.outgoing.some((o) => o.kind === 'calls' && o.node.id === 'base2.ts::shared'),
+    ).toBe(true);
+
+    // Same edge seen as incoming on the callee.
+    const callee = querySymbol(REPO_ID, 'base2.ts::shared');
+    expect(
+      callee.incoming.some((i) => i.kind === 'calls' && i.node.id === 'user2.ts::useShared'),
+    ).toBe(true);
+
+    // Bare-name lookup resolves; unknown name returns no matches.
+    expect(querySymbol(REPO_ID, 'useShared').matches.some((m) => m.id === 'user2.ts::useShared')).toBe(true);
+    expect(querySymbol(REPO_ID, 'definitely_not_a_symbol').matches).toHaveLength(0);
+  });
+
+  test('semantic overlay: advisory neighbors link near-identical symbols across files', async () => {
+    // Identical exported bodies => identical fake vectors => high cosine.
+    const body = `export function widget() { return computeTotalsForReport(); }\nfunction computeTotalsForReport() { return 42; }\n`;
+    writeProjectFile('simA.ts', body);
+    writeProjectFile('simB.ts', body);
+
+    await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
+    await buildSymbolGraph(projectRoot, REPO_ID, ['**/*.ts'], ['node_modules']);
+    const semCount = buildSemanticOverlay(REPO_ID, { minScore: 0.5, topK: 5 });
+    expect(semCount).toBeGreaterThan(0);
+
+    const w = querySymbol(REPO_ID, 'simA.ts::widget');
+    expect(w.semanticNeighbors.some((n) => n.node.id === 'simB.ts::widget')).toBe(true);
+    // Advisory neighbors carry a similarity score in (0, 1].
+    expect(w.semanticNeighbors.every((n) => n.score > 0 && n.score <= 1)).toBe(true);
   });
 });

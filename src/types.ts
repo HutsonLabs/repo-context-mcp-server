@@ -12,6 +12,22 @@ export interface GraphConfig {
   coChangeMinCount?: number;
   /** Maximum number of commits to scan for co-change analysis (default: 500) */
   coChangeMaxCommits?: number;
+  /** Symbol-level structural graph (class/function nodes + resolved edges). */
+  symbols?: SymbolGraphConfig;
+  /** Advisory embedding-similarity overlay between symbols (non-gating). */
+  semantic?: SemanticOverlayConfig;
+}
+
+export interface SymbolGraphConfig {
+  /** Build the symbol-level structural graph (default: true). */
+  enabled?: boolean;
+}
+
+export interface SemanticOverlayConfig {
+  /** Minimum cosine similarity (1 - distance) to record a neighbor (default: 0.78). */
+  minScore?: number;
+  /** Max semantic neighbors kept per symbol (default: 5). */
+  topK?: number;
 }
 
 export interface WikiConfig {
@@ -189,6 +205,79 @@ export interface DependencyGraph {
   coChanges: CoChangeEntry[];
   /** Git commit SHA at the time the graph was built */
   headSha?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Symbol-level graph types (class/function granularity)
+// ---------------------------------------------------------------------------
+
+/** Kind of a symbol declaration node. */
+export type SymbolKind =
+  | 'function'
+  | 'class'
+  | 'interface'
+  | 'type'
+  | 'enum'
+  | 'variable'
+  | 'method';
+
+/**
+ * Structural edge kind, resolved from the type checker:
+ *  - calls       — a function/method invokes another declaration
+ *  - extends     — class/interface extends another
+ *  - implements  — class implements an interface
+ *  - uses-type   — references a type/interface in a type position
+ *  - references  — any other resolved reference to a known declaration
+ */
+export type SymbolEdgeKind =
+  | 'calls'
+  | 'extends'
+  | 'implements'
+  | 'uses-type'
+  | 'references';
+
+/** A single class/function/type declaration — a node in the symbol graph. */
+export interface SymbolNode {
+  /** Stable id: "<repo-relative-file>::<name>" (methods: "file::Class.method"). */
+  id: string;
+  /** Declared name (e.g. "initDb", "Database.close"). */
+  name: string;
+  kind: SymbolKind;
+  /** Repo-relative file the symbol is declared in. */
+  file: string;
+  /** 1-based line of the declaration. */
+  line: number;
+  /** Source language (e.g. "ts"). Reserved for future polyglot extractors. */
+  lang: string;
+}
+
+/** A resolved, exact structural edge between two symbol nodes. */
+export interface SymbolEdge {
+  /** Source node id. */
+  src: string;
+  /** Target node id. */
+  dst: string;
+  kind: SymbolEdgeKind;
+}
+
+/** An advisory embedding-similarity edge between two symbol nodes (non-gating). */
+export interface SemanticEdge {
+  src: string;
+  dst: string;
+  /** Cosine similarity (1 - distance), in (minScore, 1]. */
+  score: number;
+}
+
+/** Result of a `query_symbol` lookup: definition + structural edges + overlay. */
+export interface SymbolQueryResult {
+  /** Symbol nodes matching the query (one for an exact id, possibly many for a bare name). */
+  matches: SymbolNode[];
+  /** Edges leaving the matched symbol(s): what they call / extend / use. */
+  outgoing: Array<{ kind: SymbolEdgeKind; node: SymbolNode }>;
+  /** Edges entering the matched symbol(s): what calls / extends / uses them. */
+  incoming: Array<{ kind: SymbolEdgeKind; node: SymbolNode }>;
+  /** Advisory semantic neighbors (embedding similarity), highest score first. */
+  semanticNeighbors: Array<{ node: SymbolNode; score: number }>;
 }
 
 // ---------------------------------------------------------------------------
