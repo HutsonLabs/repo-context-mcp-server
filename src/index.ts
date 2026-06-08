@@ -1,10 +1,17 @@
-// index.ts — repo-context MCP server entry point (Streamable HTTP transport)
+#!/usr/bin/env bun
+// index.ts — repo-context MCP server entry point (local stdio transport)
 //
 // Generic codebase context server. Exposes vector search (search_code,
 // search_docs, search_memory), dependency-graph queries (query_dependencies,
 // query_co_changes, query_type_consumers), wiki CRUD (search_wiki,
 // read_wiki_page, write_wiki_page, list_wiki_pages), and the partition
-// scheduler. Pointed at any repo via PROJECT_ROOT (and isolated by REPO_ID).
+// scheduler. Pointed at one repo (PROJECT_ROOT / cwd, isolated by REPO_ID).
+//
+// Runs as a local stdio MCP server: one process serves a single repo, spoken
+// over stdin/stdout JSON-RPC. All vectors + the dependency graph live in a
+// single local sqlite file (.repo-context/index.db) via sqlite-vec — no docker,
+// no Postgres, no network listener. Embeddings come from a host embedder
+// (Ollama by default). stdout is reserved for the protocol; logs go to stderr.
 //
 // Configuration resolution (first found wins):
 //   1. <cwd>/repo-context.json
@@ -16,7 +23,7 @@
 //   ~/.claude/projects/<escaped-path>/memory/
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { resolve } from 'node:path';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -67,12 +74,6 @@ const DEFAULT_SKIP_PATTERNS = [
 
 const config = loadConfig();
 
-// Container / serving config (env-overridable). Connection + embedding model
-// (and therefore the vector dimension) are shared by every repo.
-const connectionString =
-  process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/repo_context';
-const httpPort = Number(process.env.PORT ?? 3000);
-
 // Auto-detect memory directory from project path
 // Claude stores memory at ~/.claude/projects/<escaped-path>/memory/
 // e.g., /Users/hutson/repos/myproject -> -Users-hutson-repos-myproject
@@ -88,11 +89,10 @@ function deriveMemoryDir(root: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Repo registry — one entry per served repository. A request selects a repo
-// via the `X-Repo-Id` header (see the HTTP handler). When config.repos is
-// absent we synthesize a single repo from PROJECT_ROOT / REPO_ID, preserving
-// the original single-repo behavior; that synthesized repo is also the default
-// when a request omits the header.
+// Repo registry — this stdio server serves a single repo per process. The
+// config still accepts a `repos` array (shared with other tooling); when it has
+// several entries we pick one by REPO_ID, otherwise the sole / synthesized repo
+// from PROJECT_ROOT / cwd is used.
 // ---------------------------------------------------------------------------
 
 interface RepoCtx {
@@ -107,9 +107,6 @@ interface RepoCtx {
   graphConfig: GraphConfig;
 }
 
-type IndexState = 'starting' | 'building' | 'ready';
-const indexState = new Map<string, IndexState>();
-
 function buildRepoRegistry(): Map<string, RepoCtx> {
   const serverCode = config.codePatterns ?? DEFAULT_CODE_PATTERNS;
   const serverDocs = config.docPatterns ?? DEFAULT_DOC_PATTERNS;
@@ -121,7 +118,7 @@ function buildRepoRegistry(): Map<string, RepoCtx> {
       ? config.repos
       : [
           {
-            repoId: process.env.REPO_ID ?? 'default',
+            repoId: config.name ?? process.env.REPO_ID ?? 'default',
             projectRoot: process.env.PROJECT_ROOT ?? config.projectRoot ?? process.cwd(),
             memoryDir: config.memoryDir,
             codePatterns: config.codePatterns,
@@ -158,16 +155,27 @@ function buildRepoRegistry(): Map<string, RepoCtx> {
       graphConfig: def.graph ?? serverGraph,
     };
     registry.set(ctx.repoId, ctx);
-    indexState.set(ctx.repoId, 'starting');
     console.error(`[config] repo '${ctx.repoId}' -> ${ctx.projectRoot} (memory: ${ctx.memoryDir})`);
   }
   return registry;
 }
 
-const repos = buildRepoRegistry();
-// The default repo when a request sends no X-Repo-Id: the sole repo if there is
-// exactly one, otherwise undefined (header becomes mandatory).
-const defaultRepoId = repos.size === 1 ? [...repos.keys()][0] : undefined;
+// Pick the single repo this process will serve. With one configured repo, use
+// it. With several, REPO_ID selects; absent that, the first entry wins (warn).
+function selectRepo(registry: Map<string, RepoCtx>): RepoCtx {
+  if (registry.size === 0) throw new Error('no repository configured');
+  const wanted = process.env.REPO_ID;
+  if (wanted && registry.has(wanted)) return registry.get(wanted)!;
+  if (registry.size === 1) return [...registry.values()][0];
+  const first = [...registry.values()][0];
+  console.error(
+    `[config] ${registry.size} repos configured; serving '${first.repoId}'. ` +
+      `Set REPO_ID to choose another (one stdio process serves one repo).`,
+  );
+  return first;
+}
+
+const repo = selectRepo(buildRepoRegistry());
 
 // ---------------------------------------------------------------------------
 // Initial index build (per repo)
@@ -175,7 +183,6 @@ const defaultRepoId = repos.size === 1 ? [...repos.keys()][0] : undefined;
 
 async function buildIndex(repo: RepoCtx) {
   console.error(`[startup] Building index for '${repo.repoId}'...`);
-  indexState.set(repo.repoId, 'building');
   const [codeCount, docsCount, memoryCount, wikiCount] = await Promise.all([
     indexCode(repo.projectRoot, repo.repoId, config.embedding, repo.codePatterns, repo.skipPatterns),
     indexDocs(repo.projectRoot, repo.repoId, config.embedding, repo.docPatterns),
@@ -186,7 +193,7 @@ async function buildIndex(repo: RepoCtx) {
   // Build dependency graph (after code index since it uses same file patterns)
   const graph = await buildGraph(
     repo.projectRoot,
-    repo.indexDir,
+    repo.repoId,
     repo.codePatterns,
     repo.skipPatterns,
     repo.graphConfig.coChangeMinCount ?? 3,
@@ -194,7 +201,6 @@ async function buildIndex(repo: RepoCtx) {
   );
 
   const edgeCount = Object.values(graph.imports).reduce((sum, arr) => sum + arr.length, 0);
-  indexState.set(repo.repoId, 'ready');
   console.error(
     `[startup] Index built for '${repo.repoId}': ${codeCount} code, ${docsCount} docs, ${memoryCount} memory, ${wikiCount} wiki chunks, ${edgeCount} import edges, ${graph.coChanges.length} co-change pairs`,
   );
@@ -207,7 +213,7 @@ async function buildIndex(repo: RepoCtx) {
 function createMcpServer(repo: RepoCtx): McpServer {
   const server = new McpServer({
     name: 'repo-context',
-    version: '26.06.1',
+    version: '26.06.2',
   });
 
 server.tool(
@@ -316,7 +322,7 @@ server.tool(
   },
   async ({ file_path, direction, depth }) => {
     try {
-      const graph = loadGraph(repo.indexDir);
+      const graph = loadGraph(repo.repoId);
       if (!graph) {
         return { content: [{ type: 'text' as const, text: 'Dependency graph not built yet. It will be available after the next index build.' }] };
       }
@@ -362,7 +368,7 @@ server.tool(
   },
   async ({ file_path, min_count }) => {
     try {
-      const graph = loadGraph(repo.indexDir);
+      const graph = loadGraph(repo.repoId);
       if (!graph) {
         return { content: [{ type: 'text' as const, text: 'Dependency graph not built yet.' }] };
       }
@@ -394,7 +400,7 @@ server.tool(
   },
   async ({ type_name }) => {
     try {
-      const graph = loadGraph(repo.indexDir);
+      const graph = loadGraph(repo.repoId);
       if (!graph) {
         return { content: [{ type: 'text' as const, text: 'Dependency graph not built yet.' }] };
       }
@@ -569,7 +575,7 @@ server.tool(
     },
     async ({ touch_sets, min_co_change }) => {
       try {
-        const graph = loadGraph(repo.indexDir);
+        const graph = loadGraph(repo.repoId);
         if (!graph) {
           return { content: [{ type: 'text' as const, text: 'Dependency graph not built yet.' }] };
         }
@@ -591,111 +597,44 @@ server.tool(
 // Start
 // ---------------------------------------------------------------------------
 
-// Resolve which repo a request targets. Primary selector is the `X-Repo-Id`
-// header; a `/mcp/<repoId>` path segment is accepted as a fallback (handy for
-// curl/debugging). With a single configured repo and no selector, that repo is
-// the default; with several, the header becomes mandatory.
-function resolveRepoId(req: Request, url: URL): string | undefined {
-  const header = req.headers.get('x-repo-id');
-  if (header && header.trim()) return header.trim();
-  const m = url.pathname.match(/^\/mcp\/(.+)$/);
-  if (m) return decodeURIComponent(m[1]);
-  return defaultRepoId;
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'content-type': 'application/json' },
+// Background: build the initial index, then start watching. Runs after the
+// transport is connected so the client's `initialize` handshake isn't blocked
+// by the (potentially slow) first embedding pass. Tools answer immediately;
+// search returns empty and graph queries report "not built yet" until the build
+// completes.
+async function buildAndWatch(): Promise<void> {
+  await buildIndex(repo);
+  startWatcher({
+    repoId: repo.repoId,
+    projectRoot: repo.projectRoot,
+    memoryDir: repo.memoryDir,
+    wikiDir: repo.wikiDir,
+    indexDir: repo.indexDir,
+    embeddingConfig: config.embedding,
+    codePatterns: repo.codePatterns,
+    docPatterns: repo.docPatterns,
+    skipPatterns: repo.skipPatterns,
+    graphConfig: {
+      coChangeMinCount: repo.graphConfig.coChangeMinCount ?? 3,
+      coChangeMaxCommits: repo.graphConfig.coChangeMaxCommits ?? 500,
+    },
   });
 }
 
 async function main() {
   const dim = getDimensions(config.embedding);
-  await initDb({ connectionString, dim });
-  console.error(
-    `[startup] Postgres ready (dim=${dim}, repos=${[...repos.keys()].join(', ')})`,
-  );
+  const dbPath = resolve(repo.indexDir, 'index.db');
+  await initDb({ dbPath, dim });
+  console.error(`[startup] sqlite ready at ${dbPath} (dim=${dim}, repo='${repo.repoId}')`);
 
-  // Stateful Streamable HTTP: a new session creates its own transport+server,
-  // bound to the repo resolved from the request's X-Repo-Id. Subsequent
-  // requests are routed by the mcp-session-id header (repo binding sticks).
-  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+  // Connect the stdio transport first so the client can initialize immediately.
+  const server = createMcpServer(repo);
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error(`[startup] repo-context MCP server (stdio) ready for '${repo.repoId}'`);
 
-  Bun.serve({
-    port: httpPort,
-    idleTimeout: 120,
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname === '/health') {
-        const states = Object.fromEntries(indexState);
-        const values = [...indexState.values()];
-        const overall: IndexState = values.every((s) => s === 'ready')
-          ? 'ready'
-          : 'building';
-        return jsonResponse({ status: 'ok', index: overall, repos: states });
-      }
-      if (url.pathname !== '/mcp' && !url.pathname.startsWith('/mcp/')) {
-        return new Response('Not found', { status: 404 });
-      }
-      const sid = req.headers.get('mcp-session-id') ?? undefined;
-      let transport = sid ? sessions.get(sid) : undefined;
-      if (!transport) {
-        const repoId = resolveRepoId(req, url);
-        if (!repoId) {
-          return jsonResponse(
-            {
-              error: 'missing X-Repo-Id: this server hosts multiple repos',
-              available: [...repos.keys()],
-            },
-            400,
-          );
-        }
-        const repo = repos.get(repoId);
-        if (!repo) {
-          return jsonResponse(
-            { error: `unknown repo '${repoId}'`, available: [...repos.keys()] },
-            404,
-          );
-        }
-        let t: WebStandardStreamableHTTPServerTransport;
-        t = new WebStandardStreamableHTTPServerTransport({
-          sessionIdGenerator: () => crypto.randomUUID(),
-          enableJsonResponse: true,
-          onsessioninitialized: (id: string) => { sessions.set(id, t); },
-          onsessionclosed: (id: string) => { sessions.delete(id); },
-        });
-        const srv = createMcpServer(repo);
-        await srv.connect(t);
-        transport = t;
-      }
-      return transport.handleRequest(req);
-    },
-  });
-  console.error(
-    `[startup] MCP server (Streamable HTTP) listening on :${httpPort} (POST /mcp, select repo via X-Repo-Id header)`,
-  );
-
-  // Build + watch each repo. Sequential build avoids hammering the shared
-  // embedder with every repo's chunks at once.
-  for (const repo of repos.values()) {
-    await buildIndex(repo);
-    startWatcher({
-      repoId: repo.repoId,
-      projectRoot: repo.projectRoot,
-      memoryDir: repo.memoryDir,
-      wikiDir: repo.wikiDir,
-      indexDir: repo.indexDir,
-      embeddingConfig: config.embedding,
-      codePatterns: repo.codePatterns,
-      docPatterns: repo.docPatterns,
-      skipPatterns: repo.skipPatterns,
-      graphConfig: {
-        coChangeMinCount: repo.graphConfig.coChangeMinCount ?? 3,
-        coChangeMaxCommits: repo.graphConfig.coChangeMaxCommits ?? 500,
-      },
-    });
-  }
+  // Index + watch in the background; surface fatal build errors to stderr.
+  buildAndWatch().catch((err) => console.error('[startup] index build failed:', err));
 }
 
 main().catch((err) => {

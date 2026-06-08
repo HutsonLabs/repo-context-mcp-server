@@ -1,14 +1,12 @@
-// db.test.ts — integration tests for the Postgres + pgvector backend.
+// db.test.ts — integration tests for the bun:sqlite + sqlite-vec backend.
 //
 // Exercises the real dedup / upsert / prune / search lifecycle against a live
-// database. A self-contained fake embedding server stands in for Ollama/TEI, so
-// the only external dependency is Postgres (with the pgvector extension).
-//
-// Skipped unless DATABASE_URL is set, e.g.:
-//   DATABASE_URL="postgres://postgres:postgres@localhost:5432/repo_context" bun test
+// local sqlite file. A self-contained fake embedding server stands in for
+// Ollama/TEI, so the suite has no external service dependency — it only needs an
+// extension-capable sqlite (Homebrew on macOS), which initDb arranges.
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import pg from 'pg';
+import { Database } from 'bun:sqlite';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,15 +14,15 @@ import type { EmbeddingProviderConfig } from './types.js';
 import { getDimensions } from './embeddings.js';
 import {
   initDb,
+  closeDb,
   indexCode,
   searchCode,
   deleteFileFromTable,
 } from './db.js';
 
-const DB_URL = process.env.DATABASE_URL;
 const DIM = 768; // lmstudio default dim; matches fake embedder output
 
-// Unique repo id so the suite never collides with real data and cleans up cleanly.
+// Unique repo id so assertions never collide across runs.
 const REPO_ID = `__db_test_${process.pid}`;
 
 // ---------------------------------------------------------------------------
@@ -45,21 +43,27 @@ function fakeVector(text: string): number[] {
 let server: ReturnType<typeof Bun.serve> | null = null;
 let config: EmbeddingProviderConfig;
 
-// A separate client for setup/teardown and direct row-count assertions.
-let probe: pg.Client | null = null;
+// A separate read-only handle on the same db file for direct row-count
+// assertions. Only touches the plain `chunks` table (no vec extension needed).
+let probe: Database | null = null;
+let dbPath = '';
+let dbDir = '';
 
-async function countRows(source: string, filePath?: string): Promise<number> {
+function countRows(source: string, filePath?: string): number {
   const sql = filePath
-    ? `SELECT count(*)::int AS n FROM chunks WHERE repo_id = $1 AND source = $2 AND file_path = $3`
-    : `SELECT count(*)::int AS n FROM chunks WHERE repo_id = $1 AND source = $2`;
-  const params = filePath ? [REPO_ID, source, filePath] : [REPO_ID, source];
-  const { rows } = await probe!.query(sql, params);
-  return rows[0].n as number;
+    ? `SELECT count(*) AS n FROM chunks WHERE repo_id = ? AND source = ? AND file_path = ?`
+    : `SELECT count(*) AS n FROM chunks WHERE repo_id = ? AND source = ?`;
+  const row = (
+    filePath
+      ? probe!.query(sql).get(REPO_ID, source, filePath)
+      : probe!.query(sql).get(REPO_ID, source)
+  ) as { n: number };
+  return row.n;
 }
 
 // ---------------------------------------------------------------------------
 
-describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
+describe('db — bun:sqlite + sqlite-vec integration', () => {
   let projectRoot: string;
 
   beforeAll(async () => {
@@ -81,23 +85,24 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
     };
     expect(getDimensions(config)).toBe(DIM);
 
-    probe = new pg.Client({ connectionString: DB_URL });
-    await probe.connect();
-    // Pre-clean in case a previous crashed run left rows behind.
-    await probe.query(`DELETE FROM chunks WHERE repo_id = $1`, [REPO_ID]).catch(() => {});
+    dbDir = mkdtempSync(join(tmpdir(), 'rc-db-store-'));
+    dbPath = join(dbDir, 'index.db');
+    await initDb({ dbPath, dim: DIM });
 
-    await initDb({ connectionString: DB_URL!, dim: DIM });
+    // Read handle opened after initDb so it inherits the extension-capable
+    // sqlite. Plain (non-readonly) to avoid WAL/readonly snapshot quirks; the
+    // suite only reads through it.
+    probe = new Database(dbPath);
 
     projectRoot = mkdtempSync(join(tmpdir(), 'rc-db-test-'));
   });
 
-  afterAll(async () => {
-    if (probe) {
-      await probe.query(`DELETE FROM chunks WHERE repo_id = $1`, [REPO_ID]).catch(() => {});
-      await probe.end();
-    }
+  afterAll(() => {
+    probe?.close();
+    closeDb();
     server?.stop(true);
     if (projectRoot) rmSync(projectRoot, { recursive: true, force: true });
+    if (dbDir) rmSync(dbDir, { recursive: true, force: true });
   });
 
   function writeProjectFile(rel: string, contents: string): void {
@@ -106,14 +111,11 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
     writeFileSync(abs, contents);
   }
 
-  test('initDb creates the chunks table with the right vector width', async () => {
-    const { rows } = await probe!.query(
-      `SELECT atttypmod FROM pg_attribute
-        WHERE attrelid = 'chunks'::regclass AND attname = 'embedding'`,
-    );
-    expect(rows).toHaveLength(1);
-    // pgvector stores the declared dimension directly in atttypmod.
-    expect(rows[0].atttypmod).toBe(DIM);
+  test('initDb records the embedding dimension', () => {
+    const row = probe!.query(`SELECT value FROM meta WHERE key = 'dim'`).get() as
+      | { value: string }
+      | undefined;
+    expect(row?.value).toBe(String(DIM));
   });
 
   test('indexCode inserts chunks and reports a positive count', async () => {
@@ -122,15 +124,15 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
 
     const n = await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
     expect(n).toBeGreaterThan(0);
-    expect(await countRows('code')).toBe(n);
-    expect(await countRows('code', 'alpha.ts')).toBeGreaterThan(0);
+    expect(countRows('code')).toBe(n);
+    expect(countRows('code', 'alpha.ts')).toBeGreaterThan(0);
   });
 
   test('re-indexing unchanged files is a no-op (content-hash dedup)', async () => {
-    const before = await countRows('code');
+    const before = countRows('code');
     const n = await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
     expect(n).toBe(0);
-    expect(await countRows('code')).toBe(before);
+    expect(countRows('code')).toBe(before);
   });
 
   test('modifying a file replaces its chunks (upsert), not duplicates them', async () => {
@@ -149,13 +151,13 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
   });
 
   test('pruneDeletedFiles removes rows for files no longer on disk', async () => {
-    expect(await countRows('code', 'beta.ts')).toBeGreaterThan(0);
+    expect(countRows('code', 'beta.ts')).toBeGreaterThan(0);
 
     rmSync(join(projectRoot, 'beta.ts'));
     await indexCode(projectRoot, REPO_ID, config, ['**/*.ts'], ['node_modules']);
 
-    expect(await countRows('code', 'beta.ts')).toBe(0);
-    expect(await countRows('code', 'alpha.ts')).toBeGreaterThan(0);
+    expect(countRows('code', 'beta.ts')).toBe(0);
+    expect(countRows('code', 'alpha.ts')).toBeGreaterThan(0);
   });
 
   test('searchCode round-trips and respects the file_filter glob', async () => {
@@ -173,21 +175,21 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
   });
 
   test('deleteFileFromTable removes a single file immediately', async () => {
-    expect(await countRows('code', 'sub/gamma.ts')).toBeGreaterThan(0);
-    await deleteFileFromTable(REPO_ID, 'code', 'sub/gamma.ts');
-    expect(await countRows('code', 'sub/gamma.ts')).toBe(0);
+    expect(countRows('code', 'sub/gamma.ts')).toBeGreaterThan(0);
+    deleteFileFromTable(REPO_ID, 'code', 'sub/gamma.ts');
+    expect(countRows('code', 'sub/gamma.ts')).toBe(0);
     // Sibling rows are untouched.
-    expect(await countRows('code', 'alpha.ts')).toBeGreaterThan(0);
+    expect(countRows('code', 'alpha.ts')).toBeGreaterThan(0);
   });
 
-  test('all written rows are scoped to the configured repo_id', async () => {
-    const { rows } = await probe!.query(
-      `SELECT DISTINCT repo_id FROM chunks WHERE source = 'code' AND file_path = 'alpha.ts'`,
-    );
+  test('all written rows are scoped to the configured repo_id', () => {
+    const rows = probe!
+      .query(`SELECT DISTINCT repo_id FROM chunks WHERE source = 'code' AND file_path = 'alpha.ts'`)
+      .all() as Array<{ repo_id: string }>;
     expect(rows.map((r) => r.repo_id)).toContain(REPO_ID);
   });
 
-  test('two repos sharing one db/table do not see each other\'s rows', async () => {
+  test('two repos sharing one db do not see each other\'s rows', async () => {
     const REPO_B = `${REPO_ID}_b`;
     const rootB = mkdtempSync(join(tmpdir(), 'rc-db-test-b-'));
     try {
@@ -210,9 +212,8 @@ describe.skipIf(!DB_URL)('db — Postgres + pgvector integration', () => {
       // Pruning repo B leaves repo A's row for the same path intact.
       rmSync(join(rootB, 'shared.ts'));
       await indexCode(rootB, REPO_B, config, ['**/*.ts'], ['node_modules']);
-      expect(await countRows('code', 'shared.ts')).toBeGreaterThan(0); // A still present (countRows scopes to REPO_ID)
+      expect(countRows('code', 'shared.ts')).toBeGreaterThan(0); // A still present (countRows scopes to REPO_ID)
     } finally {
-      await probe!.query(`DELETE FROM chunks WHERE repo_id = $1`, [REPO_B]).catch(() => {});
       rmSync(rootB, { recursive: true, force: true });
     }
   });

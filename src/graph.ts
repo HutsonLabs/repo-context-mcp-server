@@ -7,13 +7,12 @@
 //   4. Co-change pairs from git log
 
 import ts from 'typescript';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { resolve, relative, dirname, extname } from 'node:path';
 import { execSync } from 'node:child_process';
 import { Glob } from 'bun';
 import type { DependencyGraph, TypeExport, CoChangeEntry } from './types.js';
-
-const GRAPH_FILE = 'graph.json';
+import { saveGraph, loadGraphDoc } from './db.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -21,7 +20,7 @@ const GRAPH_FILE = 'graph.json';
 
 export async function buildGraph(
   projectRoot: string,
-  indexDir: string,
+  repoId: string,
   codePatterns: string[],
   skipPatterns: string[],
   coChangeMinCount: number = 3,
@@ -119,22 +118,15 @@ export async function buildGraph(
     headSha,
   };
 
-  // Write to disk
-  const graphPath = resolve(indexDir, GRAPH_FILE);
-  writeFileSync(graphPath, JSON.stringify(graph, null, 2));
-  console.error(`[graph] Graph written to ${graphPath}`);
+  // Persist into the shared sqlite store (one JSON document per repo).
+  saveGraph(repoId, graph);
+  console.error(`[graph] Graph saved for repo '${repoId}'`);
 
   return graph;
 }
 
-export function loadGraph(indexDir: string): DependencyGraph | null {
-  const graphPath = resolve(indexDir, GRAPH_FILE);
-  if (!existsSync(graphPath)) return null;
-  try {
-    return JSON.parse(readFileSync(graphPath, 'utf-8')) as DependencyGraph;
-  } catch {
-    return null;
-  }
+export function loadGraph(repoId: string): DependencyGraph | null {
+  return loadGraphDoc(repoId);
 }
 
 // ---------------------------------------------------------------------------
