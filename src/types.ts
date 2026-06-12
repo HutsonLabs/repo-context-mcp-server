@@ -1,7 +1,7 @@
 // types.ts — Shared types for repo-context MCP server
 
 export interface EmbeddingProviderConfig {
-  type: 'openai' | 'google' | 'ollama' | 'mistral' | 'lmstudio' | 'tei';
+  type: 'openai' | 'google' | 'ollama' | 'mistral' | 'lmstudio' | 'tei' | 'omlx';
   apiKey: string | null;
   baseUrl?: string;
   model: string;

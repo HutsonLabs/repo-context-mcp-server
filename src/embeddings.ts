@@ -1,5 +1,5 @@
 // embeddings.ts — Embedding provider adapter
-// Supports: OpenAI, Google, Ollama, Mistral, LM Studio
+// Supports: OpenAI, Google, Ollama, Mistral, LM Studio, TEI, oMLX
 
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -45,6 +45,8 @@ const MODEL_DIMENSIONS: Record<string, number> = {
   'mxbai-embed-large': 1024,
   'all-minilm': 384,
   'mistral-embed': 1024,
+  'Qwen3-Embedding-0.6B': 1024,
+  'Qwen3-Embedding-0.6B-8bit': 1024,
 };
 
 const PROVIDER_DEFAULT_DIMS: Record<string, number> = {
@@ -54,6 +56,7 @@ const PROVIDER_DEFAULT_DIMS: Record<string, number> = {
   mistral: 1024,
   lmstudio: 768,
   tei: 3584,
+  omlx: 1024,
 };
 
 export function getDimensions(config: EmbeddingProviderConfig): number {
@@ -160,6 +163,25 @@ async function embedTei(texts: string[], config: EmbeddingProviderConfig): Promi
     .map((d) => d.embedding);
 }
 
+async function embedOmlx(texts: string[], config: EmbeddingProviderConfig): Promise<number[][]> {
+  // oMLX (https://github.com/jundot/omlx) exposes an OpenAI-compatible
+  // `/v1/embeddings` endpoint with bearer-token auth.
+  let root = config.baseUrl ?? 'http://localhost:11444';
+  root = root.replace(/\/v1\/?$/, '');
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  const res = await fetch(`${root}/v1/embeddings`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ model: config.model, input: texts }),
+  });
+  if (!res.ok) throw new Error(`oMLX embedding error ${res.status}: ${await res.text()}`);
+  const data = (await res.json()) as { data: Array<{ index: number; embedding: number[] }> };
+  return data.data
+    .sort((a, b) => a.index - b.index)
+    .map((d) => d.embedding);
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -171,6 +193,7 @@ const BATCH_SIZES: Record<string, number> = {
   google: 20,
   mistral: 50,
   tei: 32,
+  omlx: 32,
 };
 
 const MAX_TEXT_CHARS = 4000;
@@ -200,6 +223,12 @@ function applyPrefix(
   if (model === 'nomic-embed-text' || model.startsWith('nomic-embed-text:')) {
     return mode === 'query' ? `search_query: ${text}` : `search_document: ${text}`;
   }
+  // Qwen3-Embedding models: queries take an instruction prefix, documents none.
+  if (model.includes('Qwen3-Embedding')) {
+    return mode === 'query'
+      ? `Instruct: Given a search query, retrieve relevant code or documentation\nQuery: ${text}`
+      : text;
+  }
   // Any other model: identity.
   return text;
 }
@@ -214,6 +243,7 @@ const PROVIDERS: Record<
   lmstudio: embedLmStudio,
   mistral: embedMistral,
   tei: embedTei,
+  omlx: embedOmlx,
 };
 
 export async function embedBatch(
